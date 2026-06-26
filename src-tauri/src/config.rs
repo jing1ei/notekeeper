@@ -18,6 +18,10 @@ pub struct BotConfig {
     #[serde(default, skip_serializing)]
     pub token: String,
     pub file: String,
+    /// Folder where received files (documents, photos, etc.) are saved. If unset
+    /// or empty, files go to an `attachments` folder next to the markdown file.
+    #[serde(default)]
+    pub files_dir: Option<String>,
     /// Telegram numeric user id allowed to write. 0 = allow anyone (not recommended).
     #[serde(default)]
     pub allowed_user_id: i64,

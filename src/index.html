@@ -137,6 +137,13 @@
       </div>
       <div class="hint">If the file doesn't exist yet it will be created on the first message.</div>
 
+      <label>Files folder (for received documents, photos, etc.)</label>
+      <div class="file-row">
+        <input type="text" id="f-files-dir" placeholder="/Users/you/notes/attachments" />
+        <button class="small" id="browse-dir-btn">Browse…</button>
+      </div>
+      <div class="hint">Files sent to the bot are saved here, with a note added to the markdown file. Leave blank to use an "attachments" folder next to the markdown file.</div>
+
       <label>Your Telegram user ID (only this person can write)</label>
       <input type="number" id="f-user" placeholder="123456789" />
       <div class="hint">Get it by messaging @userinfobot. Leave 0 to allow anyone (not recommended).</div>
@@ -273,6 +280,7 @@
     $('f-token').dataset.had = bot?.has_token ? '1' : '';
     $('f-token').placeholder = bot?.has_token ? 'Leave blank to keep current token' : '123456:ABC-DEF…';
     $('f-file').value = bot?.file || '';
+    $('f-files-dir').value = bot?.files_dir || '';
     $('f-user').value = bot ? bot.allowed_user_id : 0;
     const acc = bot?.shortcut || '';
     $('f-shortcut').dataset.acc = acc;
@@ -302,6 +310,11 @@
   async function browse() {
     const path = await invoke('pick_markdown_file');
     if (path) $('f-file').value = path;
+  }
+
+  async function browseDir() {
+    const path = await invoke('pick_folder');
+    if (path) $('f-files-dir').value = path;
   }
 
   const MODIFIER_CODES = ['MetaLeft','MetaRight','ControlLeft','ControlRight',
@@ -340,6 +353,7 @@
       name: $('f-name').value.trim() || 'Untitled',
       token: $('f-token').value.trim(),
       file: $('f-file').value.trim(),
+      filesDir: $('f-files-dir').value.trim() || null,
       allowedUserId: parseInt($('f-user').value || '0', 10) || 0,
       enabled: $('f-enabled').checked,
       shortcut: $('f-shortcut').dataset.acc || null,
@@ -375,6 +389,7 @@
   $('add-btn').onclick = () => openForm();
   $('validate-btn').onclick = () => validateToken();
   $('browse-btn').onclick = () => browse();
+  $('browse-dir-btn').onclick = () => browseDir();
   $('rec-btn').onclick = () => recordShortcut();
   $('clear-shortcut-btn').onclick = () => clearShortcut();
   $('cancel-btn').onclick = () => closeForm();

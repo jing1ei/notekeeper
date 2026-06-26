@@ -42,6 +42,7 @@ struct BotView {
     /// keep". The token itself is never sent to the webview.
     has_token: bool,
     file: String,
+    files_dir: Option<String>,
     allowed_user_id: i64,
     enabled: bool,
     shortcut: Option<String>,
@@ -73,12 +74,16 @@ async fn start_bot(bot: &BotConfig, state: &AppState) {
     let id = bot.id.clone();
     let token = bot.token.clone();
     let file = bot.file.clone();
+    let files_dir = bot.files_dir.clone();
     let allowed = bot.allowed_user_id;
     let status = state.status.clone();
     let status_path = state.status_path.clone();
     let client = state.http.clone();
     tauri::async_runtime::spawn(async move {
-        run_bot(id, token, file, allowed, status, status_path, client, rx).await;
+        run_bot(
+            id, token, file, files_dir, allowed, status, status_path, client, rx,
+        )
+        .await;
     });
 }
 
@@ -157,6 +162,7 @@ async fn get_bots(state: State<'_, AppState>) -> Result<Vec<BotView>, String> {
             name: b.name.clone(),
             has_token: !b.token.is_empty(),
             file: b.file.clone(),
+            files_dir: b.files_dir.clone(),
             allowed_user_id: b.allowed_user_id,
             enabled: b.enabled,
             shortcut: b.shortcut.clone(),
@@ -173,6 +179,7 @@ async fn add_bot(
     name: String,
     token: String,
     file: String,
+    files_dir: Option<String>,
     allowed_user_id: i64,
     enabled: bool,
     shortcut: Option<String>,
@@ -182,6 +189,7 @@ async fn add_bot(
         name,
         token,
         file,
+        files_dir,
         allowed_user_id,
         enabled,
         shortcut,
@@ -214,6 +222,7 @@ async fn update_bot(
     name: String,
     token: String,
     file: String,
+    files_dir: Option<String>,
     allowed_user_id: i64,
     enabled: bool,
     shortcut: Option<String>,
@@ -236,6 +245,7 @@ async fn update_bot(
         }
         b.name = name;
         b.file = file;
+        b.files_dir = files_dir;
         b.allowed_user_id = allowed_user_id;
         b.enabled = enabled;
         b.shortcut = shortcut;
@@ -314,6 +324,22 @@ async fn pick_markdown_file(app: tauri::AppHandle) -> Option<String> {
         .pick_file(move |picked| {
             let _ = tx.send(picked);
         });
+    rx.await
+        .ok()
+        .flatten()
+        .and_then(|p| p.into_path().ok())
+        .map(|pb| pb.to_string_lossy().to_string())
+}
+
+/// Pick a folder for saving received files. Async for the same reason as
+/// `pick_markdown_file` — the native dialog must run off the main thread.
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
     rx.await
         .ok()
         .flatten()
@@ -516,6 +542,7 @@ fn main() {
             set_enabled,
             validate_token,
             pick_markdown_file,
+            pick_folder,
             open_note_file,
             get_quick_target,
             append_note

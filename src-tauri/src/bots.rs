@@ -111,6 +111,132 @@ pub async fn append_timestamped(path: &str, text: &str) -> std::io::Result<()> {
     file.flush().await
 }
 
+/// Strip anything that isn't a safe filename character. Telegram-supplied names
+/// can contain path separators or other surprises, so we keep only a basename
+/// and a conservative character set.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Pull the first downloadable attachment out of a message, returning its
+/// Telegram `file_id` and a suggested filename (when the message provides one).
+/// Checks the common attachment kinds in priority order.
+fn extract_attachment(msg: &Value) -> Option<(String, Option<String>)> {
+    for key in ["document", "video", "audio", "voice", "animation", "video_note"] {
+        if let Some(obj) = msg.get(key) {
+            if let Some(id) = obj["file_id"].as_str() {
+                let name = obj["file_name"].as_str().map(|s| s.to_string());
+                return Some((id.to_string(), name));
+            }
+        }
+    }
+    // Photos arrive as an array of sizes; the last entry is the largest.
+    if let Some(sizes) = msg["photo"].as_array() {
+        if let Some(largest) = sizes.last() {
+            if let Some(id) = largest["file_id"].as_str() {
+                return Some((id.to_string(), None));
+            }
+        }
+    }
+    // Stickers are .webp (or .tgs/.webm for animated) with no file_name.
+    if let Some(id) = msg["sticker"]["file_id"].as_str() {
+        return Some((id.to_string(), None));
+    }
+    None
+}
+
+/// Pick a unique destination path inside `dir`, prefixing the name with a
+/// timestamp and appending a counter if a same-named file already exists.
+fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let base = format!("{}_{}", stamp, sanitize_filename(name));
+    let mut candidate = dir.join(&base);
+    let mut n = 1;
+    while candidate.exists() {
+        // Insert the counter before the extension if there is one.
+        let (stem, ext) = match base.rsplit_once('.') {
+            Some((s, e)) => (s.to_string(), format!(".{}", e)),
+            None => (base.clone(), String::new()),
+        };
+        candidate = dir.join(format!("{}-{}{}", stem, n, ext));
+        n += 1;
+    }
+    candidate
+}
+
+/// Download a Telegram file by `file_id` into `dir`, returning the saved path.
+async fn download_attachment(
+    client: &reqwest::Client,
+    token: &str,
+    file_id: &str,
+    file_name: Option<&str>,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    // getFile resolves a file_id to a temporary download path on Telegram's servers.
+    let get_url = format!("https://api.telegram.org/bot{}/getFile", token);
+    let resp = client
+        .get(&get_url)
+        .query(&[("file_id", file_id)])
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| scrub(e.to_string(), token))?;
+    let json: Value = resp.json().await.map_err(|e| scrub(e.to_string(), token))?;
+    if json["ok"].as_bool() != Some(true) {
+        return Err(json["description"]
+            .as_str()
+            .unwrap_or("getFile failed")
+            .to_string());
+    }
+    let file_path = json["result"]["file_path"]
+        .as_str()
+        .ok_or_else(|| "getFile returned no file_path".to_string())?
+        .to_string();
+
+    // Fall back to the basename Telegram reports when the message had no file_name.
+    let name = file_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| file_path.rsplit('/').next().unwrap_or("file").to_string());
+
+    let dl_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+    let bytes = client
+        .get(&dl_url)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| scrub(e.to_string(), token))?
+        .error_for_status()
+        .map_err(|e| scrub(e.to_string(), token))?
+        .bytes()
+        .await
+        .map_err(|e| scrub(e.to_string(), token))?;
+
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let dest = unique_dest(dir, &name);
+    tokio::fs::write(&dest, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(dest)
+}
+
 async fn react(client: &reqwest::Client, token: &str, chat_id: i64, message_id: i64) {
     let url = format!("https://api.telegram.org/bot{}/setMessageReaction", token);
     let body = serde_json::json!({
@@ -132,6 +258,7 @@ pub async fn run_bot(
     id: String,
     token: String,
     file: String,
+    files_dir: Option<String>,
     allowed_user_id: i64,
     status: StatusMap,
     status_path: PathBuf,
@@ -160,6 +287,20 @@ pub async fn run_bot(
     // Resume from the persisted offset so a restart doesn't replay old messages.
     let mut offset: i64 = { status.lock().await.get(&id).map(|s| s.offset).unwrap_or(0) };
     let updates_url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+
+    // Resolve where received files are saved: the configured folder, or an
+    // `attachments` folder next to the markdown file when unset.
+    let save_dir: PathBuf = match files_dir.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => Path::new(&file)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("attachments"))
+            .unwrap_or_else(|| PathBuf::from("attachments")),
+    };
+
+    // Files updates need the "message" allowed_updates entry, which already
+    // covers documents/photos/etc, so no change to the polling params is needed.
 
     loop {
         if *stop_rx.borrow() {
@@ -215,17 +356,7 @@ pub async fn run_bot(
                         for update in updates {
                             let update_id = update["update_id"].as_i64();
                             let msg = &update["message"];
-                            let text = match msg["text"].as_str() {
-                                Some(t) => t.to_string(),
-                                None => {
-                                    // Non-text update: nothing to save, but confirm it
-                                    // so Telegram doesn't keep re-delivering it.
-                                    if let Some(uid) = update_id {
-                                        offset = offset.max(uid + 1);
-                                    }
-                                    continue;
-                                }
-                            };
+
                             let from_id = msg["from"]["id"].as_i64().unwrap_or(0);
                             let chat_id = msg["chat"]["id"].as_i64().unwrap_or(from_id);
                             let message_id = msg["message_id"].as_i64().unwrap_or(0);
@@ -237,6 +368,57 @@ pub async fn run_bot(
                                 }
                                 continue;
                             }
+
+                            // Decide what to write. A plain text message appends its
+                            // text; a file/photo/etc is downloaded to `save_dir` and a
+                            // note recording the saved path (plus any caption) is
+                            // appended. Anything else is acknowledged but not saved.
+                            let caption = msg["caption"].as_str().unwrap_or("").trim();
+                            let line = if let Some(t) = msg["text"].as_str() {
+                                Some(t.to_string())
+                            } else if let Some((file_id, file_name)) = extract_attachment(msg) {
+                                match download_attachment(
+                                    &client,
+                                    &token,
+                                    &file_id,
+                                    file_name.as_deref(),
+                                    &save_dir,
+                                )
+                                .await
+                                {
+                                    Ok(dest) => {
+                                        let name = dest
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "file".to_string());
+                                        let mut note =
+                                            format!("saved file: {} → {}", name, dest.display());
+                                        if !caption.is_empty() {
+                                            note.push_str(&format!(" — {}", caption));
+                                        }
+                                        Some(note)
+                                    }
+                                    Err(e) => {
+                                        // Treat a failed download like a failed write:
+                                        // record the error and don't advance the offset,
+                                        // so Telegram re-delivers and we retry.
+                                        set_status(&status, &id, |s| {
+                                            s.last_error = Some(format!("file save failed: {}", e));
+                                        })
+                                        .await;
+                                        write_failed = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Non-text, non-file update: nothing to save, but confirm
+                                // it so Telegram doesn't keep re-delivering it.
+                                if let Some(uid) = update_id {
+                                    offset = offset.max(uid + 1);
+                                }
+                                continue;
+                            };
+                            let Some(text) = line else { continue };
 
                             match append_timestamped(&file, &text).await {
                                 Ok(()) => {

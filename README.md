@@ -2,6 +2,8 @@
 
 A macOS **menu bar app**. Each Telegram bot is bound 1-to-1 to a local markdown file.
 Send the bot any text message and it appends that text (with a timestamp) to its file.
+Send it a file, photo, or other attachment and it saves the file to a folder you choose
+and adds a timestamped note to the markdown file recording what was saved and where.
 Manage the bindings — add, edit, enable/disable, remove — from a small table UI, and
 watch each bot's live status from the menu bar.
 
@@ -78,6 +80,9 @@ Click **+ Add bot**, then:
 - **Bot token** — paste it, click **Validate token** to confirm it connects
 - **Markdown file** — **Browse…** to pick an existing file, or type a full path (it's
   created automatically on the first message if it doesn't exist)
+- **Files folder** *(optional)* — **Browse…** to pick where received files (documents,
+  photos, etc.) are saved. Leave blank to use an `attachments` folder next to the
+  markdown file.
 - **Your Telegram user ID** — from @userinfobot
 - **Local shortcut** *(optional)* — click **Record** and press a hotkey (see below)
 - **Enabled** — leave checked to start immediately
@@ -124,8 +129,17 @@ Each message becomes one timestamped line, appended to the file:
 - [2026-06-25 14:31] idea: a bot that writes to markdown
 ```
 
-Only text messages from your allowed user ID are saved; everything else is ignored.
-The bot reacts with 👍 on each saved message so you get confirmation in Telegram.
+Send a file, photo, or other attachment and it's downloaded to the bot's **Files folder**;
+a note recording the saved filename and path (plus any caption) is appended to the file:
+
+```
+- [2026-06-25 14:32] saved file: 20260625-143200_report.pdf → /Users/you/notes/attachments/20260625-143200_report.pdf
+- [2026-06-25 14:33] saved file: 20260625-143300_photo.jpg → /Users/you/notes/attachments/20260625-143300_photo.jpg — vacation pic
+```
+
+Saved files are prefixed with a timestamp so names never collide. Only messages from your
+allowed user ID are saved; anything else is ignored. The bot reacts with 👍 on each saved
+message or file so you get confirmation in Telegram.
 
 ## Where settings live
 

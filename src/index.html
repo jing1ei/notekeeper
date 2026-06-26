@@ -92,7 +92,7 @@
       <h1>Notekeeper</h1>
       <div class="sub" id="summary">Loading…</div>
     </div>
-    <button class="primary" onclick="openForm()">+ Add bot</button>
+    <button class="primary" id="add-btn">+ Add bot</button>
   </header>
 
   <main>
@@ -124,16 +124,16 @@
       <input type="text" id="f-name" placeholder="Ideas" />
 
       <label>Bot token (from @BotFather)</label>
-      <input type="text" id="f-token" placeholder="123456:ABC-DEF…" oninput="clearValidate()" />
+      <input type="text" id="f-token" placeholder="123456:ABC-DEF…" />
       <div class="file-row" style="margin-top:6px">
-        <button class="small" onclick="validateToken()">Validate token</button>
+        <button class="small" id="validate-btn">Validate token</button>
       </div>
       <div class="validate-msg" id="validate-msg"></div>
 
       <label>Markdown file</label>
       <div class="file-row">
         <input type="text" id="f-file" placeholder="/Users/you/notes/ideas.md" />
-        <button class="small" onclick="browse()">Browse…</button>
+        <button class="small" id="browse-btn">Browse…</button>
       </div>
       <div class="hint">If the file doesn't exist yet it will be created on the first message.</div>
 
@@ -144,8 +144,8 @@
       <label>Local shortcut (optional)</label>
       <div class="file-row">
         <input type="text" id="f-shortcut" placeholder="e.g. ⌘⇧I — click Record" readonly />
-        <button class="small" id="rec-btn" onclick="recordShortcut()">Record</button>
-        <button class="small" onclick="clearShortcut()">Clear</button>
+        <button class="small" id="rec-btn">Record</button>
+        <button class="small" id="clear-shortcut-btn">Clear</button>
       </div>
       <div class="hint">Press this hotkey anywhere on the Mac to pop up a quick-note box for this file.</div>
 
@@ -155,15 +155,22 @@
       </div>
 
       <div class="modal-actions">
-        <button onclick="closeForm()">Cancel</button>
-        <button class="primary" id="save-btn" onclick="save()">Save</button>
+        <button id="cancel-btn">Cancel</button>
+        <button class="primary" id="save-btn">Save</button>
       </div>
     </div>
   </div>
 
 <script>
-  const invoke = window.__TAURI__.core.invoke;
   const $ = (id) => document.getElementById(id);
+  // If the Tauri backend isn't attached (e.g. this .html was opened directly in
+  // a browser, or it's a stale build), don't let the whole script crash on the
+  // missing global — that would leave every button (including "Add bot") dead.
+  // Define a stub instead so the UI still loads and the problem is visible.
+  const tauriReady = !!(window.__TAURI__ && window.__TAURI__.core);
+  const invoke = tauriReady
+    ? window.__TAURI__.core.invoke
+    : () => Promise.reject(new Error('Not running inside the Notekeeper app'));
 
   function basename(p) { return p ? p.split('/').pop() : ''; }
   // Escape for both text and attribute contexts (quotes included, since esc()
@@ -199,6 +206,11 @@
   }
 
   async function refresh() {
+    if (!tauriReady) {
+      $('summary').textContent = '⚠️ Backend not attached — open Notekeeper from the menu bar, not the .html file.';
+      $('empty').style.display = 'none';
+      return;
+    }
     let bots = [];
     try { bots = await invoke('get_bots'); } catch (e) { console.error(e); }
     const rows = $('rows');
@@ -255,7 +267,11 @@
     $('modal-title').textContent = bot ? 'Edit bot' : 'Add bot';
     $('f-id').value = bot?.id || '';
     $('f-name').value = bot?.name || '';
-    $('f-token').value = bot?.token || '';
+    // The token is never sent to the UI. On edit, leaving this blank keeps the
+    // token already stored in the Keychain.
+    $('f-token').value = '';
+    $('f-token').dataset.had = bot?.has_token ? '1' : '';
+    $('f-token').placeholder = bot?.has_token ? 'Leave blank to keep current token' : '123456:ABC-DEF…';
     $('f-file').value = bot?.file || '';
     $('f-user').value = bot ? bot.allowed_user_id : 0;
     const acc = bot?.shortcut || '';
@@ -328,7 +344,9 @@
       enabled: $('f-enabled').checked,
       shortcut: $('f-shortcut').dataset.acc || null,
     };
-    if (!args.token || !args.file) {
+    // On edit, a blank token keeps the existing one; on add, a token is required.
+    const hadToken = $('f-token').dataset.had === '1';
+    if ((!args.token && !hadToken) || !args.file) {
       const m = $('validate-msg'); m.textContent = 'Token and file are required.'; m.className = 'validate-msg bad';
       return;
     }
@@ -350,6 +368,18 @@
     await invoke('remove_bot', { id });
     refresh();
   }
+
+  // Wire up the static controls here (not as inline on* attributes): a release
+  // build's CSP nonces the <script>, which makes the browser ignore
+  // 'unsafe-inline', so inline onclick handlers would be silently blocked.
+  $('add-btn').onclick = () => openForm();
+  $('validate-btn').onclick = () => validateToken();
+  $('browse-btn').onclick = () => browse();
+  $('rec-btn').onclick = () => recordShortcut();
+  $('clear-shortcut-btn').onclick = () => clearShortcut();
+  $('cancel-btn').onclick = () => closeForm();
+  $('save-btn').onclick = () => save();
+  $('f-token').oninput = () => clearValidate();
 
   refresh();
   // Poll only while the window is actually visible; refresh immediately on return.

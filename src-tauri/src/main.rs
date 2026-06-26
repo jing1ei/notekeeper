@@ -38,7 +38,9 @@ pub struct AppState {
 struct BotView {
     id: String,
     name: String,
-    token: String,
+    /// Whether a token is stored, so the edit form can show "leave blank to
+    /// keep". The token itself is never sent to the webview.
+    has_token: bool,
     file: String,
     allowed_user_id: i64,
     enabled: bool,
@@ -153,7 +155,7 @@ async fn get_bots(state: State<'_, AppState>) -> Result<Vec<BotView>, String> {
         .map(|b| BotView {
             id: b.id.clone(),
             name: b.name.clone(),
-            token: b.token.clone(),
+            has_token: !b.token.is_empty(),
             file: b.file.clone(),
             allowed_user_id: b.allowed_user_id,
             enabled: b.enabled,
@@ -189,7 +191,13 @@ async fn add_bot(
     {
         let mut config = state.config.lock().await;
         config.bots.push(bot.clone());
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
+        if let Err(e) = config.save(&state.config_path) {
+            // Roll back so a failed save doesn't leave an orphan Keychain entry
+            // or an in-memory bot that was never persisted.
+            config.bots.pop();
+            secrets::delete_token(&bot.id);
+            return Err(e.to_string());
+        }
     }
     if bot.enabled {
         start_bot(&bot, state.inner()).await;
@@ -210,6 +218,7 @@ async fn update_bot(
     enabled: bool,
     shortcut: Option<String>,
 ) -> Result<(), String> {
+    let new_token = token.trim().to_string();
     let updated;
     {
         let mut config = state.config.lock().await;
@@ -218,19 +227,27 @@ async fn update_bot(
             .iter_mut()
             .find(|b| b.id == id)
             .ok_or_else(|| "bot not found".to_string())?;
+        // A blank token means "keep the existing one". Otherwise write the new
+        // token to the Keychain *before* mutating in-memory state, so a Keychain
+        // failure leaves the config untouched.
+        if !new_token.is_empty() {
+            secrets::set_token(&id, &new_token)?;
+            b.token = new_token;
+        }
         b.name = name;
-        b.token = token;
         b.file = file;
         b.allowed_user_id = allowed_user_id;
         b.enabled = enabled;
         b.shortcut = shortcut;
         updated = b.clone();
-        secrets::set_token(&updated.id, &updated.token)?;
         config.save(&state.config_path).map_err(|e| e.to_string())?;
     }
-    stop_bot(&id, state.inner()).await;
+    // start_bot stops any existing task first, so only stop explicitly here when
+    // the bot is being disabled.
     if updated.enabled {
         start_bot(&updated, state.inner()).await;
+    } else {
+        stop_bot(&id, state.inner()).await;
     }
     sync_shortcuts(&app).await;
     Ok(())

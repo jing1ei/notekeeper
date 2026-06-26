@@ -166,5 +166,3 @@ notekeeper/
   token elsewhere (e.g. a second copy of the app) or Telegram returns a 409 conflict.
 - Leaving the user ID at `0` lets **anyone** who finds the bot write to your file — set
   your real ID unless you have a reason not to.
-- This was generated without a local compile. If `cargo tauri dev` reports any build
-  error, it'll be a small API-name fix — send it over and it's a quick patch.

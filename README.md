@@ -51,16 +51,19 @@ For **each** markdown file you want to feed:
 
 ## 3. Run it
 
-Development / first try:
+The repo ships three double-clickable helper scripts — run them from Finder, no
+Terminal needed. They set up cargo's PATH and add resilience for flaky networks:
+
+- **`run-dev.command`** — run the app from the current source with the dev console
+  open (no install, no stale `/Applications` copy). Good for a first try.
+- **`build.command`** — compile a release bundle and reveal `Notekeeper.app` in Finder.
+- **`commit.command`** — stage everything, commit (prompts for a message), and push.
+
+Prefer the command line? The equivalents are:
 
 ```bash
-cargo tauri dev
-```
-
-Build a real app bundle:
-
-```bash
-cargo tauri build
+cargo tauri dev     # development / first try
+cargo tauri build   # build a real app bundle
 ```
 
 The finished app is at
@@ -157,6 +160,9 @@ Keychain automatically on first launch and stripped from the file.
 ```
 notekeeper/
 ├─ app-icon.png              # source icon (run: cargo tauri icon app-icon.png)
+├─ run-dev.command           # double-click: run from source (dev console)
+├─ build.command             # double-click: build Notekeeper.app
+├─ commit.command            # double-click: stage, commit & push
 ├─ src/                      # the UI (static HTML/CSS/JS — no build step)
 │  ├─ index.html             # bot manager table
 │  └─ quick.html             # the pop-up quick-capture box

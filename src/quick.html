@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Quick note</title>
+<style>
+  :root {
+    --card: #2a2c30; --text: #e7e9ec; --muted: #9aa0a8; --border: #3c4046; --accent: #4f8cff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --card: #ffffff; --text: #1c1e21; --muted: #6b7280; --border: #e2e5ea; }
+  }
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; padding: 10px;
+  }
+  .card {
+    flex: 1; background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    padding: 14px 16px; display: flex; flex-direction: column;
+  }
+  .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .target { font-size: 13px; color: var(--text); font-weight: 600; }
+  .target span { color: var(--accent); }
+  .hint { font-size: 11px; color: var(--muted); }
+  textarea {
+    flex: 1; resize: none; border: none; outline: none; background: transparent;
+    color: var(--text); font: inherit; font-size: 15px; line-height: 1.4;
+  }
+  textarea::placeholder { color: var(--muted); }
+  .saved { color: var(--accent); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <div class="target">→ <span id="target">…</span></div>
+      <div class="hint" id="hint">Enter to save · Esc to cancel</div>
+    </div>
+    <textarea id="input" placeholder="Type a note…"></textarea>
+  </div>
+
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const { getCurrentWindow } = window.__TAURI__.window;
+  const win = getCurrentWindow();
+  const input = document.getElementById('input');
+  const targetEl = document.getElementById('target');
+  const hintEl = document.getElementById('hint');
+  let target = null;
+
+  function applyTarget(t) {
+    target = t;
+    targetEl.textContent = t ? t.name : 'no target';
+  }
+
+  async function refreshTarget() {
+    try { applyTarget(await invoke('get_quick_target')); } catch (e) { console.error(e); }
+  }
+
+  // Initial load + every time the hotkey re-opens this window.
+  refreshTarget();
+  window.__TAURI__.event.listen('quick-open', (e) => {
+    applyTarget(e.payload);
+    input.value = '';
+    hintEl.textContent = 'Enter to save · Esc to cancel';
+    hintEl.className = 'hint';
+    setTimeout(() => input.focus(), 30);
+  });
+
+  setTimeout(() => input.focus(), 50);
+
+  async function save() {
+    const text = input.value.trim();
+    if (!text || !target) { win.hide(); return; }
+    try {
+      await invoke('append_note', { id: target.id, text });
+      hintEl.textContent = 'Saved ✓';
+      hintEl.className = 'hint saved';
+      input.value = '';
+      setTimeout(() => win.hide(), 250);
+    } catch (e) {
+      hintEl.textContent = '✗ ' + e;
+    }
+  }
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+    else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; win.hide(); }
+  });
+
+  // Dismiss when the window loses focus (e.g. you click elsewhere).
+  window.addEventListener('blur', () => { win.hide(); });
+</script>
+</body>
+</html>

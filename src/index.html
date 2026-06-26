@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Notekeeper</title>
+<style>
+  :root {
+    --bg: #1e1f22;
+    --panel: #2a2c30;
+    --panel-2: #33363b;
+    --text: #e7e9ec;
+    --muted: #9aa0a8;
+    --border: #3c4046;
+    --accent: #4f8cff;
+    --accent-press: #3b6fd1;
+    --green: #34c759;
+    --red: #ff5c5c;
+    --yellow: #ffcc33;
+    --grey: #6b7280;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1c1e21;
+      --muted: #6b7280; --border: #e2e5ea;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  button {
+    font: inherit; border: 1px solid var(--border); background: var(--panel-2);
+    color: var(--text); padding: 7px 12px; border-radius: 8px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: var(--accent-press); }
+  button.danger:hover { border-color: var(--red); color: var(--red); }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  main { padding: 16px 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+       padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
+  .dot.green { background: var(--green); } .dot.red { background: var(--red); }
+  .dot.yellow { background: var(--yellow); } .dot.grey { background: var(--grey); }
+  .name { font-weight: 600; } .at { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .path { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .path.open { cursor: pointer; }
+  .path.open:hover { color: var(--accent); text-decoration: underline; }
+  .err { color: var(--red); font-size: 12px; }
+  .kbd { font-size: 12px; padding: 3px 7px; border: 1px solid var(--border);
+         border-radius: 6px; background: var(--panel-2); }
+  .empty { color: var(--muted); text-align: center; padding: 48px 0; }
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  /* modal */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+             display: none; align-items: center; justify-content: center; }
+  .overlay.show { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+           width: 460px; max-width: 92vw; padding: 20px; }
+  .modal h2 { margin: 0 0 14px; font-size: 15px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); font: inherit;
+  }
+  .file-row { display: flex; gap: 8px; }
+  .file-row input { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  .check input { width: 16px; height: 16px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .validate-msg { font-size: 12px; margin-top: 6px; min-height: 16px; }
+  .ok { color: var(--green); } .bad { color: var(--red); }
+  .toggle { cursor: pointer; user-select: none; }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Notekeeper</h1>
+      <div class="sub" id="summary">Loading…</div>
+    </div>
+    <button class="primary" onclick="openForm()">+ Add bot</button>
+  </header>
+
+  <main>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:23%">Bot</th>
+          <th style="width:29%">Markdown file</th>
+          <th style="width:15%">Shortcut</th>
+          <th style="width:12%">Activity</th>
+          <th style="width:9%">Enabled</th>
+          <th style="width:12%"></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" style="display:none">
+      No bots yet. Click <b>+ Add bot</b> to bind a Telegram bot to a markdown file.
+    </div>
+  </main>
+
+  <!-- Add / edit modal -->
+  <div class="overlay" id="overlay">
+    <div class="modal">
+      <h2 id="modal-title">Add bot</h2>
+      <input type="hidden" id="f-id" />
+
+      <label>Name</label>
+      <input type="text" id="f-name" placeholder="Ideas" />
+
+      <label>Bot token (from @BotFather)</label>
+      <input type="text" id="f-token" placeholder="123456:ABC-DEF…" oninput="clearValidate()" />
+      <div class="file-row" style="margin-top:6px">
+        <button class="small" onclick="validateToken()">Validate token</button>
+      </div>
+      <div class="validate-msg" id="validate-msg"></div>
+
+      <label>Markdown file</label>
+      <div class="file-row">
+        <input type="text" id="f-file" placeholder="/Users/you/notes/ideas.md" />
+        <button class="small" onclick="browse()">Browse…</button>
+      </div>
+      <div class="hint">If the file doesn't exist yet it will be created on the first message.</div>
+
+      <label>Your Telegram user ID (only this person can write)</label>
+      <input type="number" id="f-user" placeholder="123456789" />
+      <div class="hint">Get it by messaging @userinfobot. Leave 0 to allow anyone (not recommended).</div>
+
+      <label>Local shortcut (optional)</label>
+      <div class="file-row">
+        <input type="text" id="f-shortcut" placeholder="e.g. ⌘⇧I — click Record" readonly />
+        <button class="small" id="rec-btn" onclick="recordShortcut()">Record</button>
+        <button class="small" onclick="clearShortcut()">Clear</button>
+      </div>
+      <div class="hint">Press this hotkey anywhere on the Mac to pop up a quick-note box for this file.</div>
+
+      <div class="check">
+        <input type="checkbox" id="f-enabled" checked />
+        <label for="f-enabled" style="margin:0;color:var(--text)">Enabled (start polling now)</label>
+      </div>
+
+      <div class="modal-actions">
+        <button onclick="closeForm()">Cancel</button>
+        <button class="primary" id="save-btn" onclick="save()">Save</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const invoke = window.__TAURI__.core.invoke;
+  const $ = (id) => document.getElementById(id);
+
+  function basename(p) { return p ? p.split('/').pop() : ''; }
+  // Escape for both text and attribute contexts (quotes included, since esc()
+  // output is interpolated into title="..." attributes below).
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  const MOD = { CmdOrCtrl: '⌘', CommandOrControl: '⌘', Command: '⌘', Cmd: '⌘', Super: '⌘',
+                Meta: '⌘', Control: '⌃', Ctrl: '⌃', Alt: '⌥', Option: '⌥', Shift: '⇧' };
+  function prettyShortcut(acc) {
+    return acc.split('+').map(p => {
+      if (MOD[p]) return MOD[p];
+      if (/^Key([A-Z])$/.test(p)) return p.slice(3);
+      if (/^Digit(\d)$/.test(p)) return p.slice(5);
+      return p.replace('Arrow', '').replace('Numpad', '');
+    }).join('');
+  }
+
+  function dotClass(b) {
+    if (!b.enabled) return 'grey';
+    if (b.status.last_error) return 'red';
+    if (b.status.running) return 'green';
+    return 'yellow';
+  }
+  function dotTitle(b) {
+    if (!b.enabled) return 'Disabled';
+    if (b.status.last_error) return 'Error: ' + b.status.last_error;
+    if (b.status.running) return 'Running';
+    return 'Starting…';
+  }
+
+  async function refresh() {
+    let bots = [];
+    try { bots = await invoke('get_bots'); } catch (e) { console.error(e); }
+    const rows = $('rows');
+    rows.innerHTML = '';
+    $('empty').style.display = bots.length ? 'none' : 'block';
+
+    let running = 0, errors = 0;
+    for (const b of bots) {
+      if (b.enabled && b.status.running && !b.status.last_error) running++;
+      if (b.enabled && b.status.last_error) errors++;
+      const at = b.status.username ? '@' + b.status.username : '';
+      const last = b.status.last_message_at ? 'last ' + b.status.last_message_at : '';
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>
+          <span class="dot ${dotClass(b)}" title="${esc(dotTitle(b))}"></span>
+          <span class="name">${esc(b.name)}</span> <span class="at">${esc(at)}</span>
+          ${b.status.last_error ? `<div class="err">${esc(b.status.last_error)}</div>` : ''}
+        </td>
+        <td>${b.file
+            ? `<span class="path open" data-open="${esc(b.file)}" title="Open in text editor">${esc(b.file)}</span>`
+            : '<span class="path">—</span>'}</td>
+        <td>${b.shortcut ? `<span class="kbd">${esc(prettyShortcut(b.shortcut))}</span>` : '<span class="at">—</span>'}</td>
+        <td>${b.status.message_count} saved<div class="at">${esc(last)}</div></td>
+        <td><span class="toggle" title="Click to toggle" data-id="${b.id}" data-en="${b.enabled}">
+            ${b.enabled ? '✅' : '⬜️'}</span></td>
+        <td><div class="row-actions">
+          <button class="small" data-edit="${b.id}">Edit</button>
+          <button class="small danger" data-del="${b.id}">Remove</button>
+        </div></td>`;
+      rows.appendChild(tr);
+    }
+
+    rows.querySelectorAll('[data-open]').forEach(el =>
+      el.onclick = async () => {
+        try { await invoke('open_note_file', { file: el.dataset.open }); }
+        catch (e) { alert('Could not open file: ' + e); }
+      });
+    rows.querySelectorAll('[data-edit]').forEach(el =>
+      el.onclick = () => openForm(bots.find(x => x.id === el.dataset.edit)));
+    rows.querySelectorAll('[data-del]').forEach(el =>
+      el.onclick = () => removeBot(el.dataset.del, bots.find(x => x.id === el.dataset.del)));
+    rows.querySelectorAll('.toggle').forEach(el =>
+      el.onclick = async () => {
+        await invoke('set_enabled', { id: el.dataset.id, enabled: el.dataset.en !== 'true' });
+        refresh();
+      });
+
+    $('summary').textContent =
+      `${bots.length} bot${bots.length === 1 ? '' : 's'} · ${running} running${errors ? ' · ' + errors + ' error(s)' : ''}`;
+  }
+
+  function openForm(bot) {
+    $('modal-title').textContent = bot ? 'Edit bot' : 'Add bot';
+    $('f-id').value = bot?.id || '';
+    $('f-name').value = bot?.name || '';
+    $('f-token').value = bot?.token || '';
+    $('f-file').value = bot?.file || '';
+    $('f-user').value = bot ? bot.allowed_user_id : 0;
+    const acc = bot?.shortcut || '';
+    $('f-shortcut').dataset.acc = acc;
+    $('f-shortcut').value = acc ? prettyShortcut(acc) : '';
+    $('f-enabled').checked = bot ? bot.enabled : true;
+    clearValidate();
+    $('overlay').classList.add('show');
+  }
+  function closeForm() { $('overlay').classList.remove('show'); }
+  function clearValidate() { $('validate-msg').textContent = ''; $('validate-msg').className = 'validate-msg'; }
+
+  async function validateToken() {
+    const token = $('f-token').value.trim();
+    if (!token) return;
+    const msg = $('validate-msg');
+    msg.textContent = 'Checking…'; msg.className = 'validate-msg';
+    try {
+      const username = await invoke('validate_token', { token });
+      msg.textContent = '✓ Connected to @' + username;
+      msg.className = 'validate-msg ok';
+    } catch (e) {
+      msg.textContent = '✗ ' + e;
+      msg.className = 'validate-msg bad';
+    }
+  }
+
+  async function browse() {
+    const path = await invoke('pick_markdown_file');
+    if (path) $('f-file').value = path;
+  }
+
+  const MODIFIER_CODES = ['MetaLeft','MetaRight','ControlLeft','ControlRight',
+                          'AltLeft','AltRight','ShiftLeft','ShiftRight'];
+  function recordShortcut() {
+    const inp = $('f-shortcut'), btn = $('rec-btn');
+    inp.value = 'Press keys…'; btn.textContent = '…';
+    const onKey = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === 'Escape') { cancel(); return; }
+      if (MODIFIER_CODES.includes(e.code)) return; // wait for a real key
+      const mods = [];
+      if (e.metaKey) mods.push('CmdOrCtrl');
+      if (e.ctrlKey) mods.push('Control');
+      if (e.altKey) mods.push('Alt');
+      if (e.shiftKey) mods.push('Shift');
+      if (mods.length === 0) {
+        // A bare key would register globally and hijack it system-wide.
+        inp.value = 'Add ⌘ / ⌃ / ⌥ / ⇧ …';
+        return; // keep listening for a valid combo
+      }
+      const acc = [...mods, e.code].join('+');
+      inp.dataset.acc = acc;
+      inp.value = prettyShortcut(acc);
+      cleanup();
+    };
+    const cancel = () => { inp.value = inp.dataset.acc ? prettyShortcut(inp.dataset.acc) : ''; cleanup(); };
+    const cleanup = () => { window.removeEventListener('keydown', onKey, true); btn.textContent = 'Record'; };
+    window.addEventListener('keydown', onKey, true);
+  }
+  function clearShortcut() { $('f-shortcut').dataset.acc = ''; $('f-shortcut').value = ''; }
+
+  async function save() {
+    const id = $('f-id').value;
+    const args = {
+      name: $('f-name').value.trim() || 'Untitled',
+      token: $('f-token').value.trim(),
+      file: $('f-file').value.trim(),
+      allowedUserId: parseInt($('f-user').value || '0', 10) || 0,
+      enabled: $('f-enabled').checked,
+      shortcut: $('f-shortcut').dataset.acc || null,
+    };
+    if (!args.token || !args.file) {
+      const m = $('validate-msg'); m.textContent = 'Token and file are required.'; m.className = 'validate-msg bad';
+      return;
+    }
+    $('save-btn').disabled = true;
+    try {
+      if (id) await invoke('update_bot', { id, ...args });
+      else await invoke('add_bot', args);
+      closeForm();
+      refresh();
+    } catch (e) {
+      const m = $('validate-msg'); m.textContent = '✗ ' + e; m.className = 'validate-msg bad';
+    } finally {
+      $('save-btn').disabled = false;
+    }
+  }
+
+  async function removeBot(id, bot) {
+    if (!confirm(`Remove "${bot?.name || 'this bot'}"? The markdown file is left untouched.`)) return;
+    await invoke('remove_bot', { id });
+    refresh();
+  }
+
+  refresh();
+  // Poll only while the window is actually visible; refresh immediately on return.
+  setInterval(() => { if (!document.hidden) refresh(); }, 3000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

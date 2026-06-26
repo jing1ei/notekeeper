@@ -1,0 +1,26 @@
+# Rust / Tauri build artifacts
+/src-tauri/target/
+**/*.rs.bk
+
+# Local runtime/config (these live in the OS app-config dir, but never commit
+# them if a copy ends up in the tree — they can contain bot tokens / IDs).
+bots.json
+status.json
+*.corrupt-*
+*.tmp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Node (in case a frontend toolchain is added later)
+node_modules/
+dist/

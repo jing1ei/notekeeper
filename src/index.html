@@ -170,10 +170,8 @@
 
 <script>
   const $ = (id) => document.getElementById(id);
-  // If the Tauri backend isn't attached (e.g. this .html was opened directly in
-  // a browser, or it's a stale build), don't let the whole script crash on the
-  // missing global — that would leave every button (including "Add bot") dead.
-  // Define a stub instead so the UI still loads and the problem is visible.
+  // If the Tauri backend isn't attached (e.g. opened as a plain .html), fall back
+  // to a stub so the UI still loads and surfaces the problem instead of crashing.
   const tauriReady = !!(window.__TAURI__ && window.__TAURI__.core);
   const invoke = tauriReady
     ? window.__TAURI__.core.invoke

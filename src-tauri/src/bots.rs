@@ -34,9 +34,8 @@ pub type StatusMap = Arc<Mutex<HashMap<String, BotStatus>>>;
 
 /// Remove the bot token from a message before it is shown or stored.
 ///
-/// `reqwest` includes the full request URL in its error `Display`, and our URLs
-/// embed the token (`/bot<TOKEN>/getUpdates`). Without this, a network error
-/// would surface the token in the UI, the tray tooltip, logs, and screenshots.
+/// `reqwest` includes the token-bearing request URL in its error `Display`, so
+/// without this a network error would leak the token into the UI, tray, and logs.
 fn scrub(msg: String, token: &str) -> String {
     if token.is_empty() {
         msg
@@ -418,10 +417,9 @@ pub async fn run_bot(
                                         Some(note)
                                     }
                                     Err(e) if e.permanent => {
-                                        // Telegram won't ever serve this file (usually it's
-                                        // bigger than getFile's ~20 MB limit). Record a note
-                                        // and let the offset advance, so one un-downloadable
-                                        // file can't block every later message forever.
+                                        // Telegram will never serve this file (usually >20 MB).
+                                        // Record a note and let the offset advance so it can't
+                                        // block every later message forever.
                                         let mut note =
                                             format!("could not save file: {}", e.msg);
                                         if !caption.is_empty() {
@@ -510,9 +508,7 @@ pub async fn run_bot(
         }
     }
 
-    // Note: we intentionally do NOT clear `running` here. This loop only exits
-    // after a stop signal, and `stop_bot` already sets `running = false`
-    // synchronously. Clearing it again here would race with a freshly started
-    // task during a restart (edit/toggle), clobbering the new task's
-    // `running = true` back to `false`.
+    // Deliberately don't clear `running` here: `stop_bot` already did so before
+    // signalling stop, and clearing it again would race a freshly started task
+    // during a restart, flipping its `running = true` back to false.
 }

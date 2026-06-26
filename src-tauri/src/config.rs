@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
+use uuid::Uuid;
 
 fn default_true() -> bool {
     true
@@ -11,10 +12,9 @@ fn default_true() -> bool {
 pub struct BotConfig {
     pub id: String,
     pub name: String,
-    /// The Telegram bot token. Held in memory only — it is read from / written to
-    /// the macOS Keychain (see `secrets.rs`) and is deliberately NOT serialized to
-    /// `bots.json`. `default` lets older plaintext configs (which did store the
-    /// token) still deserialize, so the token can be migrated into the Keychain.
+    /// The Telegram bot token. In-memory only: stored in the macOS Keychain (see
+    /// `secrets.rs`), never serialized to `bots.json`. `default` lets older
+    /// plaintext configs still deserialize so their token can be migrated out.
     #[serde(default, skip_serializing)]
     pub token: String,
     pub file: String,
@@ -83,7 +83,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension("tmp");
+    // Unique temp name so concurrent writers (e.g. several bots persisting
+    // status at once) don't clobber each other's in-flight temp file.
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;

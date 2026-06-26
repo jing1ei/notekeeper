@@ -52,7 +52,8 @@ For **each** markdown file you want to feed:
 ## 3. Run it
 
 The repo ships three double-clickable helper scripts — run them from Finder, no
-Terminal needed. They set up cargo's PATH and add resilience for flaky networks:
+Terminal needed. The two build scripts set up cargo's PATH and add resilience for
+flaky networks:
 
 - **`run-dev.command`** — run the app from the current source with the dev console
   open (no install, no stale `/Applications` copy). Good for a first try.

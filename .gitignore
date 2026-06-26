@@ -8,6 +8,7 @@ bots.json
 status.json
 *.corrupt-*
 *.tmp
+*.tmp-*
 
 # macOS
 .DS_Store

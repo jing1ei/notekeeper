@@ -231,15 +231,19 @@ async fn update_bot(
     let updated;
     {
         let mut config = state.config.lock().await;
-        let b = config
+        let idx = config
             .bots
-            .iter_mut()
-            .find(|b| b.id == id)
+            .iter()
+            .position(|b| b.id == id)
             .ok_or_else(|| "bot not found".to_string())?;
+        // Keep the previous state so a failed save can be rolled back.
+        let prev = config.bots[idx].clone();
+        let token_changed = !new_token.is_empty();
+        let b = &mut config.bots[idx];
         // A blank token means "keep the existing one". Otherwise write the new
         // token to the Keychain *before* mutating in-memory state, so a Keychain
         // failure leaves the config untouched.
-        if !new_token.is_empty() {
+        if token_changed {
             secrets::set_token(&id, &new_token)?;
             b.token = new_token;
         }
@@ -250,7 +254,15 @@ async fn update_bot(
         b.enabled = enabled;
         b.shortcut = shortcut;
         updated = b.clone();
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
+        if let Err(e) = config.save(&state.config_path) {
+            // Restore in-memory state, and the Keychain too if we'd replaced the
+            // token, so the saved token can't drift ahead of the persisted config.
+            if token_changed {
+                let _ = secrets::set_token(&id, &prev.token);
+            }
+            config.bots[idx] = prev;
+            return Err(e.to_string());
+        }
     }
     // start_bot stops any existing task first, so only stop explicitly here when
     // the bot is being disabled.

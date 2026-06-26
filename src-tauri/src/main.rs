@@ -281,12 +281,24 @@ async fn remove_bot(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    stop_bot(&id, state.inner()).await;
     {
         let mut config = state.config.lock().await;
-        config.bots.retain(|b| b.id != id);
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
+        let idx = config
+            .bots
+            .iter()
+            .position(|b| b.id == id)
+            .ok_or_else(|| "bot not found".to_string())?;
+        let removed = config.bots.remove(idx);
+        if let Err(e) = config.save(&state.config_path) {
+            // Re-insert on a failed save so the bot isn't dropped from memory
+            // only. Nothing destructive (stop/Keychain) has run yet, so the
+            // still-running bot stays consistent.
+            config.bots.insert(idx, removed);
+            return Err(e.to_string());
+        }
     }
+    // The removal is durable now — tear down the running bot and its secrets.
+    stop_bot(&id, state.inner()).await;
     // Remove the bot's token from the Keychain so it doesn't linger.
     secrets::delete_token(&id);
     state.status.lock().await.remove(&id);
@@ -302,14 +314,18 @@ async fn set_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> R
     let bot;
     {
         let mut config = state.config.lock().await;
-        let b = config
+        let idx = config
             .bots
-            .iter_mut()
-            .find(|b| b.id == id)
+            .iter()
+            .position(|b| b.id == id)
             .ok_or_else(|| "bot not found".to_string())?;
-        b.enabled = enabled;
-        bot = b.clone();
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
+        let prev = config.bots[idx].enabled;
+        config.bots[idx].enabled = enabled;
+        bot = config.bots[idx].clone();
+        if let Err(e) = config.save(&state.config_path) {
+            config.bots[idx].enabled = prev;
+            return Err(e.to_string());
+        }
     }
     if enabled {
         start_bot(&bot, state.inner()).await;

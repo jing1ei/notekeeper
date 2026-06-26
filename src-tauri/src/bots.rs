@@ -236,14 +236,25 @@ async fn download_attachment(
         .unwrap_or_else(|| file_path.rsplit('/').next().unwrap_or("file").to_string());
 
     let dl_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
-    let bytes = client
+    let resp = client
         .get(&dl_url)
         .timeout(Duration::from_secs(300))
         .send()
         .await
-        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?
-        .error_for_status()
-        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        // 4xx means Telegram won't serve this path (expired/invalid) — retrying
+        // can't help, so treat it as permanent and skip past the message. 5xx and
+        // the like are transient and worth retrying.
+        let msg = format!("file download returned HTTP {}", status.as_u16());
+        return Err(if status.is_client_error() {
+            DownloadError::permanent(msg)
+        } else {
+            DownloadError::transient(msg)
+        });
+    }
+    let bytes = resp
         .bytes()
         .await
         .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;

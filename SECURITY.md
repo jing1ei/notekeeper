@@ -22,8 +22,9 @@ long polling. The main assets to protect are:
 - **Bot tokens** — stored in the macOS **Keychain** (service
   `com.notekeeper.app`), not in `bots.json`. Tokens are redacted from any error
   messages shown in the UI, tray, or logs.
-- **Your notes** — plain markdown/text files at paths you choose. Only text
-  messages from the configured Telegram user ID are written.
+- **Your notes** — plain markdown/text files at paths you choose, plus any
+  files/photos received (saved to a folder you pick). Only messages from the
+  configured Telegram user ID are written or downloaded.
 
 ### Things to be aware of
 

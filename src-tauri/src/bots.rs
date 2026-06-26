@@ -180,6 +180,23 @@ fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     candidate
 }
 
+/// A failed download. `permanent` means Telegram itself rejected the file (e.g.
+/// it exceeds getFile's ~20 MB download limit), so retrying can't help and the
+/// caller should skip past the message instead of blocking on it.
+struct DownloadError {
+    permanent: bool,
+    msg: String,
+}
+
+impl DownloadError {
+    fn transient(msg: String) -> Self {
+        Self { permanent: false, msg }
+    }
+    fn permanent(msg: String) -> Self {
+        Self { permanent: true, msg }
+    }
+}
+
 /// Download a Telegram file by `file_id` into `dir`, returning the saved path.
 async fn download_attachment(
     client: &reqwest::Client,
@@ -187,7 +204,7 @@ async fn download_attachment(
     file_id: &str,
     file_name: Option<&str>,
     dir: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, DownloadError> {
     // getFile resolves a file_id to a temporary download path on Telegram's servers.
     let get_url = format!("https://api.telegram.org/bot{}/getFile", token);
     let resp = client
@@ -196,17 +213,22 @@ async fn download_attachment(
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| scrub(e.to_string(), token))?;
-    let json: Value = resp.json().await.map_err(|e| scrub(e.to_string(), token))?;
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;
     if json["ok"].as_bool() != Some(true) {
-        return Err(json["description"]
-            .as_str()
-            .unwrap_or("getFile failed")
-            .to_string());
+        return Err(DownloadError::permanent(
+            json["description"]
+                .as_str()
+                .unwrap_or("getFile failed")
+                .to_string(),
+        ));
     }
     let file_path = json["result"]["file_path"]
         .as_str()
-        .ok_or_else(|| "getFile returned no file_path".to_string())?
+        .ok_or_else(|| DownloadError::permanent("getFile returned no file_path".to_string()))?
         .to_string();
 
     // Fall back to the basename Telegram reports when the message had no file_name.
@@ -220,20 +242,20 @@ async fn download_attachment(
         .timeout(Duration::from_secs(300))
         .send()
         .await
-        .map_err(|e| scrub(e.to_string(), token))?
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?
         .error_for_status()
-        .map_err(|e| scrub(e.to_string(), token))?
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?
         .bytes()
         .await
-        .map_err(|e| scrub(e.to_string(), token))?;
+        .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;
 
     tokio::fs::create_dir_all(dir)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| DownloadError::transient(e.to_string()))?;
     let dest = unique_dest(dir, &name);
     tokio::fs::write(&dest, &bytes)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| DownloadError::transient(e.to_string()))?;
     Ok(dest)
 }
 
@@ -298,9 +320,6 @@ pub async fn run_bot(
             .map(|p| p.join("attachments"))
             .unwrap_or_else(|| PathBuf::from("attachments")),
     };
-
-    // Files updates need the "message" allowed_updates entry, which already
-    // covers documents/photos/etc, so no change to the polling params is needed.
 
     loop {
         if *stop_rx.borrow() {
@@ -398,12 +417,25 @@ pub async fn run_bot(
                                         }
                                         Some(note)
                                     }
+                                    Err(e) if e.permanent => {
+                                        // Telegram won't ever serve this file (usually it's
+                                        // bigger than getFile's ~20 MB limit). Record a note
+                                        // and let the offset advance, so one un-downloadable
+                                        // file can't block every later message forever.
+                                        let mut note =
+                                            format!("could not save file: {}", e.msg);
+                                        if !caption.is_empty() {
+                                            note.push_str(&format!(" — {}", caption));
+                                        }
+                                        Some(note)
+                                    }
                                     Err(e) => {
-                                        // Treat a failed download like a failed write:
-                                        // record the error and don't advance the offset,
-                                        // so Telegram re-delivers and we retry.
+                                        // Transient (network/disk) failure: record the error
+                                        // and don't advance the offset, so Telegram re-delivers
+                                        // and we retry.
                                         set_status(&status, &id, |s| {
-                                            s.last_error = Some(format!("file save failed: {}", e));
+                                            s.last_error =
+                                                Some(format!("file save failed: {}", e.msg));
                                         })
                                         .await;
                                         write_failed = true;

@@ -33,14 +33,12 @@ source "$HOME/.cargo/env"
 cargo install tauri-cli --version "^2"
 ```
 
-Generate the icon set from the supplied source image (run once, from the project root):
+The icon set in `src-tauri/icons/` is already committed, so you can skip this. Only
+regenerate it if you swap in your own 1024×1024 PNG:
 
 ```bash
 cargo tauri icon app-icon.png
 ```
-
-(That creates `src-tauri/icons/`. Replace `app-icon.png` with your own 1024×1024 PNG
-first if you'd like a different icon.)
 
 ## 2. Create your bots in Telegram
 
@@ -180,3 +178,5 @@ notekeeper/
   token elsewhere (e.g. a second copy of the app) or Telegram returns a 409 conflict.
 - Leaving the user ID at `0` lets **anyone** who finds the bot write to your file — set
   your real ID unless you have a reason not to.
+- Telegram caps bot file downloads at ~20 MB. A larger file can't be fetched; instead of
+  saving it, the bot appends a `could not save file:` note and moves on.

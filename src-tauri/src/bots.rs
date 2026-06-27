@@ -845,7 +845,11 @@ pub async fn run_bot(
         set_status(&status, &id, |s| s.last_daily_error = None).await;
     }
 
-    // Validate token / fetch username up front.
+    // Validate token / fetch username up front. If this fails (e.g. a transient
+    // network blip at launch) `have_username` stays false and the poll loop
+    // re-fetches the handle on its first successful getUpdates, so the dashboard
+    // isn't left without an @username until the next restart.
+    let mut have_username = false;
     match get_me(&client, &base, &token).await {
         Ok(name) => {
             set_status(&status, &id, |s| {
@@ -854,6 +858,7 @@ pub async fn run_bot(
                 s.running = true;
             })
             .await;
+            have_username = true;
         }
         Err(e) => {
             set_status(&status, &id, |s| {
@@ -948,6 +953,17 @@ pub async fn run_bot(
                         s.running = true;
                     })
                     .await;
+
+                    // The initial getMe failed but the network is clearly back
+                    // now (this getUpdates succeeded), so re-fetch the @username
+                    // once instead of leaving the dashboard handle blank for the
+                    // rest of the session.
+                    if !have_username {
+                        if let Ok(name) = get_me(&client, &base, &token).await {
+                            set_status(&status, &id, |s| s.username = Some(name)).await;
+                            have_username = true;
+                        }
+                    }
 
                     if let Some(updates) = json["result"].as_array() {
                         let start_offset = offset;

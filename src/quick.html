@@ -40,6 +40,11 @@
     color: var(--text); font: inherit; font-size: 15px; line-height: 1.4;
   }
   textarea::placeholder { color: var(--muted); }
+  .pending {
+    display: none; flex: 0 0 auto; margin-top: 6px;
+    font-size: 11px; color: var(--accent);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .saved { color: var(--accent); }
 </style>
 </head>
@@ -50,6 +55,7 @@
       <div class="hint" id="hint">Enter to save · drop files to attach · Esc to cancel</div>
     </div>
     <textarea id="input" placeholder="Type a note, or drop files here…"></textarea>
+    <div class="pending" id="pending"></div>
     <div class="dropmask" id="dropmask">Drop to save to this note</div>
   </div>
 
@@ -61,7 +67,17 @@
   const targetEl = document.getElementById('target');
   const hintEl = document.getElementById('hint');
   const card = document.querySelector('.card');
+  const pendingEl = document.getElementById('pending');
   const DEFAULT_HINT = 'Enter to save · drop files to attach · Esc to cancel';
+  // Files dropped onto the window queue up here until you press Enter, so you can
+  // drop several (across multiple drags) and add a note before saving them all.
+  let pendingFiles = [];
+  const basename = (p) => p ? p.split(/[\\/]/).pop() : p;
+  function renderPending() {
+    if (!pendingFiles.length) { pendingEl.style.display = 'none'; pendingEl.textContent = ''; return; }
+    pendingEl.style.display = 'block';
+    pendingEl.textContent = '📎 ' + pendingFiles.map(f => f.name).join(', ');
+  }
   if (!(window.__TAURI__ && window.__TAURI__.core)) {
     targetEl.textContent = 'not in app';
     hintEl.textContent = 'Open Notekeeper from the menu bar.';
@@ -87,6 +103,8 @@
   window.__TAURI__.event.listen('quick-open', (e) => {
     applyTarget(e.payload);
     input.value = '';
+    pendingFiles = [];
+    renderPending();
     hintEl.textContent = DEFAULT_HINT;
     hintEl.className = 'hint';
     dragging = false;
@@ -98,22 +116,32 @@
   setTimeout(() => input.focus(), 50);
 
   async function save() {
+    if (!target) { win.hide(); return; }
     const text = input.value.trim();
-    if (!text || !target) { win.hide(); return; }
+    const files = pendingFiles.map(f => f.path);
+    // Nothing typed and nothing queued — just dismiss.
+    if (!text && !files.length) { win.hide(); return; }
     try {
-      await invoke('append_note', { id: target.id, text });
-      hintEl.textContent = 'Saved ✓';
+      if (text) { await invoke('append_note', { id: target.id, text }); input.value = ''; }
+      let savedFiles = 0;
+      if (files.length) { savedFiles = await invoke('save_files', { id: target.id, paths: files }); }
+      pendingFiles = [];
+      renderPending();
+      const parts = [];
+      if (text) parts.push('note');
+      if (savedFiles) parts.push(savedFiles + ' file' + (savedFiles === 1 ? '' : 's'));
+      hintEl.textContent = 'Saved ' + parts.join(' + ') + ' ✓';
       hintEl.className = 'hint saved';
-      input.value = '';
-      setTimeout(() => win.hide(), 250);
+      setTimeout(() => win.hide(), 400);
     } catch (e) {
       hintEl.textContent = '✗ ' + e;
+      hintEl.className = 'hint';
     }
   }
 
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
-    else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; win.hide(); }
+    else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; pendingFiles = []; renderPending(); win.hide(); }
   });
 
   // ---- file drag-and-drop ----
@@ -133,29 +161,30 @@
   function scheduleHide() {
     clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
-      if (!dragging && !document.hasFocus()) win.hide();
+      if (dragging || document.hasFocus()) return;
+      // Don't auto-dismiss queued files or a typed note out of existence — that
+      // work would be lost. Esc cancels explicitly; a successful save still hides.
+      if (pendingFiles.length || input.value.trim()) return;
+      win.hide();
     }, 400);
   }
 
-  async function saveFiles(paths) {
-    if (!target) { return; }
+  // Queue dropped files instead of saving immediately, so you can drop several
+  // (across multiple drags) and optionally add a note, then press Enter to save
+  // them all at once. The window stays up and refocuses, ready for more.
+  function addPending(paths) {
     const files = (paths || []).filter(Boolean);
     if (!files.length) return;
-    // Don't silently discard a note the user typed before dropping: save it
-    // first so dropping files alongside typed text doesn't lose the text.
-    const text = input.value.trim();
-    hintEl.textContent = 'Saving ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…';
-    hintEl.className = 'hint';
-    try {
-      if (text) { await invoke('append_note', { id: target.id, text }); input.value = ''; }
-      const n = await invoke('save_files', { id: target.id, paths: files });
-      hintEl.textContent = 'Saved ' + n + ' file' + (n === 1 ? '' : 's') + ' ✓';
-      hintEl.className = 'hint saved';
-      setTimeout(() => win.hide(), 800);
-    } catch (e) {
-      hintEl.textContent = '✗ ' + e;
-      hintEl.className = 'hint';
+    for (const p of files) {
+      if (!pendingFiles.some(f => f.path === p)) pendingFiles.push({ path: p, name: basename(p) });
     }
+    renderPending();
+    hintEl.textContent = pendingFiles.length + ' file' + (pendingFiles.length === 1 ? '' : 's') + ' ready · Enter to save · Esc to cancel';
+    hintEl.className = 'hint';
+    // Keep the popup open and focused for another drop, a note, or Enter.
+    clearTimeout(hideTimer);
+    win.setFocus().catch(() => {});
+    setTimeout(() => input.focus(), 30);
   }
 
   // Tauri captures OS file drops (dragDropEnabled is on by default) and emits
@@ -180,7 +209,7 @@
     dragging = false;
     card.classList.remove('drop');
     const paths = (e.payload && e.payload.paths) || [];
-    saveFiles(paths);
+    addPending(paths);
   });
 
   // Dismiss when the window loses focus (e.g. you click elsewhere), unless a

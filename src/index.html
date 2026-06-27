@@ -359,11 +359,22 @@
   }
 
   // The daily send only runs when a Telegram user ID is set (that ID is also the
-  // chat the file is sent to). Warn when it's ticked but the ID is blank/0, so it
+  // chat the file is sent to) AND the bot is enabled (the send rides the poll
+  // loop). Warn when it's ticked but either prerequisite is missing, so it
   // doesn't silently never fire.
   function updateDailyWarn() {
+    const warn = $('f-daily-warn');
+    if (!$('f-daily').checked) { warn.style.display = 'none'; return; }
     const idSet = (parseInt($('f-user').value || '0', 10) || 0) !== 0;
-    $('f-daily-warn').style.display = ($('f-daily').checked && !idSet) ? 'block' : 'none';
+    if (!idSet) {
+      warn.textContent = '⚠️ Set your Telegram user ID above — the daily send can\'t run without it.';
+      warn.style.display = 'block';
+    } else if (!$('f-enabled').checked) {
+      warn.textContent = '⚠️ Enable the bot below — the daily send only runs while the bot is enabled.';
+      warn.style.display = 'block';
+    } else {
+      warn.style.display = 'none';
+    }
   }
   function closeForm() { $('overlay').classList.remove('show'); }
   function clearValidate() { $('validate-msg').textContent = ''; $('validate-msg').className = 'validate-msg'; }
@@ -532,6 +543,7 @@
   $('f-token').oninput = () => clearValidate();
   $('f-daily').onchange = () => updateDailyWarn();
   $('f-user').oninput = () => updateDailyWarn();
+  $('f-enabled').onchange = () => updateDailyWarn();
 
   refresh();
   // Poll only while the window is actually visible; refresh immediately on return.

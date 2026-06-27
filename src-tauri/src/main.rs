@@ -543,6 +543,7 @@ async fn update_server_config(
         let prev = config.server.clone();
         // A blank api_hash means "keep the stored one". Write to the Keychain
         // before mutating in-memory state so a Keychain failure changes nothing.
+        let mut hash_changed = false;
         if let Some(h) = api_hash
             .as_deref()
             .map(str::trim)
@@ -550,6 +551,7 @@ async fn update_server_config(
         {
             secrets::set_server_api_hash(h)?;
             config.server.api_hash = h.to_string();
+            hash_changed = true;
         }
         config.server.enabled = enabled;
         config.server.bin_path = bin_path
@@ -558,6 +560,13 @@ async fn update_server_config(
         config.server.port = port;
         config.server.api_id = api_id;
         if let Err(e) = config.save(&state.config_path) {
+            // Restore the Keychain too if we'd replaced the api_hash, so the
+            // stored secret can't drift ahead of the persisted config (mirrors
+            // the rollback in `update_bot`). Without this, a failed save would
+            // leave the new hash in the Keychain but the old config on disk.
+            if hash_changed {
+                let _ = secrets::set_server_api_hash(&prev.api_hash);
+            }
             config.server = prev;
             return Err(e.to_string());
         }
@@ -686,6 +695,92 @@ async fn append_note(state: State<'_, AppState>, id: String, text: String) -> Re
     Ok(())
 }
 
+/// Copy one or more local files into a bot's destination folder and log each in
+/// its markdown file (used by the quick-capture window's drag-and-drop). Mirrors
+/// the Telegram file-receive path: files land in the same `files_dir` (or the
+/// `attachments` folder beside the note file) with a unique timestamped name,
+/// and each gets a `saved file: name → dest` note. The original is left in
+/// place — this copies, it doesn't move.
+#[tauri::command]
+async fn save_files(
+    state: State<'_, AppState>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<usize, String> {
+    let (file, files_dir) = {
+        let cfg = state.config.lock().await;
+        let bot = cfg
+            .bots
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| "bot not found".to_string())?;
+        (bot.file.clone(), bot.files_dir.clone())
+    };
+
+    let save_dir = bots::resolve_save_dir(&file, files_dir.as_deref());
+    tokio::fs::create_dir_all(&save_dir)
+        .await
+        .map_err(|e| format!("could not create destination folder: {}", e))?;
+
+    // Bump the saved counter immediately after each file lands (not once at the
+    // end) so a failure partway through still reflects the files already copied
+    // and noted — otherwise an early return would undercount them.
+    async fn record_saved(state: &AppState, id: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        {
+            let mut map = state.status.lock().await;
+            let e = map.entry(id.to_string()).or_default();
+            e.message_count += n;
+            e.last_message_at = Some(Local::now().format("%H:%M").to_string());
+        }
+        bots::persist_status(&state.status_path, &state.status).await;
+    }
+
+    let mut saved = 0usize;
+    for src in &paths {
+        let src_path = Path::new(src);
+        // Only files are saved; reject folders (and surface unreadable paths)
+        // rather than silently doing nothing.
+        match tokio::fs::metadata(src_path).await {
+            Ok(m) if m.is_dir() => {
+                record_saved(state.inner(), &id, saved as u64).await;
+                return Err(format!(
+                    "{} is a folder — drop individual files, not folders",
+                    src_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| src.clone())
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                record_saved(state.inner(), &id, saved as u64).await;
+                return Err(format!("can't read {}: {}", src, e));
+            }
+        }
+        let name = src_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let dest = bots::unique_dest(&save_dir, &name);
+        if let Err(e) = tokio::fs::copy(src_path, &dest).await {
+            record_saved(state.inner(), &id, saved as u64).await;
+            return Err(format!("could not copy {}: {}", name, e));
+        }
+        let note = format!("saved file: {} → {}", name, dest.display());
+        if let Err(e) = bots::append_timestamped(&file, &note).await {
+            record_saved(state.inner(), &id, saved as u64).await;
+            return Err(format!("{} copied but note write failed: {}", name, e));
+        }
+        saved += 1;
+    }
+
+    record_saved(state.inner(), &id, saved as u64).await;
+    Ok(saved)
+}
+
 // ---- tray ----
 
 /// A cheap fingerprint of everything the tray displays, so we only rebuild the
@@ -810,7 +905,8 @@ fn main() {
             pick_folder,
             open_note_file,
             get_quick_target,
-            append_note
+            append_note,
+            save_files
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

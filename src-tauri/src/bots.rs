@@ -131,8 +131,18 @@ pub fn remove_journal(status_path: &Path, id: &str) {
 }
 
 /// Persist the journal atomically.
+///
+/// An empty journal removes the file rather than leaving an empty `[]` behind.
+/// Besides keeping things tidy, this closes a race with bot removal: if the
+/// worker finishes its last job (emptying the journal) just after `remove_bot`
+/// has deleted the file, this removes it again instead of recreating it as an
+/// orphan that lingers for a bot that no longer exists.
 async fn persist_journal(path: &Path, journal: &Journal) {
     let snapshot = { journal.lock().await.clone() };
+    if snapshot.is_empty() {
+        let _ = tokio::fs::remove_file(path).await;
+        return;
+    }
     if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
         let _ = atomic_write(path, text.as_bytes());
     }
@@ -287,9 +297,24 @@ fn extract_attachment(msg: &Value) -> Option<Attachment> {
     None
 }
 
+/// Resolve where a bot's received/saved files go: the configured `files_dir`,
+/// or an `attachments` folder next to the markdown file when unset. Shared by
+/// the Telegram download path and the quick-window's local file drops so both
+/// land in the same place.
+pub fn resolve_save_dir(file: &str, files_dir: Option<&str>) -> PathBuf {
+    match files_dir.map(str::trim) {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => Path::new(file)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("attachments"))
+            .unwrap_or_else(|| PathBuf::from("attachments")),
+    }
+}
+
 /// Pick a unique destination path inside `dir`, prefixing the name with a
 /// timestamp and appending a counter if a same-named file already exists.
-fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+pub fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let base = format!("{}_{}", stamp, sanitize_filename(name));
     let mut candidate = dir.join(&base);
@@ -845,14 +870,7 @@ pub async fn run_bot(
 
     // Resolve where received files are saved: the configured folder, or an
     // `attachments` folder next to the markdown file when unset.
-    let save_dir: PathBuf = match files_dir.as_deref().map(str::trim) {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => Path::new(&file)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.join("attachments"))
-            .unwrap_or_else(|| PathBuf::from("attachments")),
-    };
+    let save_dir: PathBuf = resolve_save_dir(&file, files_dir.as_deref());
 
     // Whether file downloads are subject to the public API's 20 MB cap.
     let capped = base == DEFAULT_API_BASE;

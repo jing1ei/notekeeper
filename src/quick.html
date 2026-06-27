@@ -20,7 +20,17 @@
     flex: 1; background: var(--card); border: 1px solid var(--border);
     border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.35);
     padding: 14px 16px; display: flex; flex-direction: column;
+    position: relative;
   }
+  /* Highlight while a file is dragged over the window. */
+  .card.drop { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent), 0 12px 40px rgba(0,0,0,.35); }
+  .dropmask {
+    position: absolute; inset: 0; border-radius: 14px; display: none;
+    align-items: center; justify-content: center; pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 12%, var(--card));
+    color: var(--accent); font-size: 14px; font-weight: 600;
+  }
+  .card.drop .dropmask { display: flex; }
   .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
   .target { font-size: 13px; color: var(--text); font-weight: 600; }
   .target span { color: var(--accent); }
@@ -37,9 +47,10 @@
   <div class="card">
     <div class="top">
       <div class="target">→ <span id="target">…</span></div>
-      <div class="hint" id="hint">Enter to save · Esc to cancel</div>
+      <div class="hint" id="hint">Enter to save · drop files to attach · Esc to cancel</div>
     </div>
-    <textarea id="input" placeholder="Type a note…"></textarea>
+    <textarea id="input" placeholder="Type a note, or drop files here…"></textarea>
+    <div class="dropmask" id="dropmask">Drop to save to this note</div>
   </div>
 
 <script>
@@ -49,6 +60,8 @@
   const input = document.getElementById('input');
   const targetEl = document.getElementById('target');
   const hintEl = document.getElementById('hint');
+  const card = document.querySelector('.card');
+  const DEFAULT_HINT = 'Enter to save · drop files to attach · Esc to cancel';
   if (!(window.__TAURI__ && window.__TAURI__.core)) {
     targetEl.textContent = 'not in app';
     hintEl.textContent = 'Open Notekeeper from the menu bar.';
@@ -74,8 +87,11 @@
   window.__TAURI__.event.listen('quick-open', (e) => {
     applyTarget(e.payload);
     input.value = '';
-    hintEl.textContent = 'Enter to save · Esc to cancel';
+    hintEl.textContent = DEFAULT_HINT;
     hintEl.className = 'hint';
+    dragging = false;
+    clearTimeout(hideTimer);
+    card.classList.remove('drop');
     setTimeout(() => input.focus(), 30);
   });
 
@@ -100,8 +116,76 @@
     else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; win.hide(); }
   });
 
-  // Dismiss when the window loses focus (e.g. you click elsewhere).
-  window.addEventListener('blur', () => { win.hide(); });
+  // ---- file drag-and-drop ----
+  // Copy dropped files into this note's destination folder via the backend.
+  let dragging = false;
+  let hideTimer = null;
+
+  // Grabbing a file from Finder activates Finder, which blurs (and would
+  // normally hide) this popup before the drag ever reaches it. So defer the
+  // hide briefly and let an incoming drag cancel it, instead of hiding at once.
+  //
+  // The condition is re-checked when the timer *fires*, not just when it's
+  // scheduled: if a drag has re-entered the window or focus has come back in the
+  // meantime, we keep the popup open. This avoids a race where dragging out of
+  // the small window and back in (taking longer than the delay) would hide it
+  // before the file could be dropped.
+  function scheduleHide() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (!dragging && !document.hasFocus()) win.hide();
+    }, 400);
+  }
+
+  async function saveFiles(paths) {
+    if (!target) { return; }
+    const files = (paths || []).filter(Boolean);
+    if (!files.length) return;
+    // Don't silently discard a note the user typed before dropping: save it
+    // first so dropping files alongside typed text doesn't lose the text.
+    const text = input.value.trim();
+    hintEl.textContent = 'Saving ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…';
+    hintEl.className = 'hint';
+    try {
+      if (text) { await invoke('append_note', { id: target.id, text }); input.value = ''; }
+      const n = await invoke('save_files', { id: target.id, paths: files });
+      hintEl.textContent = 'Saved ' + n + ' file' + (n === 1 ? '' : 's') + ' ✓';
+      hintEl.className = 'hint saved';
+      setTimeout(() => win.hide(), 800);
+    } catch (e) {
+      hintEl.textContent = '✗ ' + e;
+      hintEl.className = 'hint';
+    }
+  }
+
+  // Tauri captures OS file drops (dragDropEnabled is on by default) and emits
+  // these events with real filesystem paths — exactly what save_files needs.
+  const ev = window.__TAURI__.event;
+  ev.listen('tauri://drag-enter', () => {
+    dragging = true;
+    clearTimeout(hideTimer);
+    card.classList.add('drop');
+  });
+  ev.listen('tauri://drag-over', () => {
+    dragging = true;
+    clearTimeout(hideTimer);
+  });
+  ev.listen('tauri://drag-leave', () => {
+    dragging = false;
+    card.classList.remove('drop');
+    // The drag left without dropping; if we're not the active window, dismiss.
+    if (!document.hasFocus()) scheduleHide();
+  });
+  ev.listen('tauri://drag-drop', (e) => {
+    dragging = false;
+    card.classList.remove('drop');
+    const paths = (e.payload && e.payload.paths) || [];
+    saveFiles(paths);
+  });
+
+  // Dismiss when the window loses focus (e.g. you click elsewhere), unless a
+  // file is being dragged in.
+  window.addEventListener('blur', () => { scheduleHide(); });
 </script>
 </body>
 </html>

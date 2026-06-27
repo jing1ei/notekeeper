@@ -114,7 +114,9 @@ Each bot also auto-reconnects after network blips on its own.
 Each file can have a **global hotkey**. Press it anywhere on the Mac — even when
 Notekeeper isn't focused — and a small input box pops up over whatever you're doing,
 already pointed at that file. Type, press **Enter**, and it's appended (same timestamped
-format as the bot); **Esc** or clicking away dismisses it.
+format as the bot); **Esc** or clicking away dismisses it. You can also **drag files onto
+the box** to copy them into the bot's files folder (the same place Telegram attachments go),
+with a note added to the markdown file — exactly like sending the bot a file.
 
 Set one per bot in the manager: edit the bot, click **Record**, and press the keys (e.g.
 ⌘⇧I). Pick combinations that include ⌘/⌥/⌃ so they don't clash with normal typing. The

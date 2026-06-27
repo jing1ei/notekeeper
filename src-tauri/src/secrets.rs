@@ -2,13 +2,16 @@
 //!
 //! Tokens are kept out of `bots.json` entirely: the config file stores only the
 //! non-secret bot metadata, while each token lives in the login Keychain under
-//! the service `com.notekeeper.app`, keyed by the bot's UUID. This keeps secrets
+//! the fixed service `com.notekeeper.app`, keyed by the bot's UUID. This keeps secrets
 //! out of plaintext on disk (and out of any backup of the config file).
 
 use crate::config::Config;
 use keyring::Entry;
 
-/// Keychain service name. Matches the app's bundle identifier.
+/// Keychain service name. Kept fixed at the original `com.notekeeper.app` on
+/// purpose — it is intentionally *not* derived from the Tauri bundle identifier,
+/// so renaming the bundle id (e.g. away from the `.app` suffix macOS dislikes)
+/// never strands previously stored tokens under an old service name.
 const SERVICE: &str = "com.notekeeper.app";
 
 /// Fixed Keychain key for the global local-server `api_hash`. The leading

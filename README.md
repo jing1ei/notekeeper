@@ -170,7 +170,7 @@ confirm on completion rather than up front, so they never look stuck mid-save.
 Your bot list (names, file paths, user IDs, shortcuts) is stored at:
 
 ```
-~/Library/Application Support/com.notekeeper.app/bots.json
+~/Library/Application Support/com.notekeeper.desktop/bots.json
 ```
 
 **Bot tokens are not kept in that file.** They live in the macOS **Keychain**

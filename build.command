@@ -67,8 +67,11 @@ if CARGO_NET_OFFLINE=true cargo tauri build; then
   build_succeeded=true
 else
   echo
-  echo "ℹ️  Offline build didn't complete — a few crates (e.g. keyring) aren't"
-  echo "   cached yet. This is a SMALL download; the rest is already on disk."
+  echo "ℹ️  Offline build didn't complete. Two common causes:"
+  echo "     • a few crates (e.g. keyring) aren't cached yet (a SMALL download), or"
+  echo "     • the .dmg packaging step (bundle_dmg.sh) hit a transient Finder/"
+  echo "       hdiutil race — harmless, and it usually succeeds on the next run."
+  echo "   Fetching any missing crates, then building again…"
   echo
   # Download just the missing crate sources first. `cargo fetch` is much lighter
   # than a full build, so on a flaky connection it has many quick chances to slip

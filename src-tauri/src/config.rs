@@ -7,6 +7,63 @@ fn default_true() -> bool {
     true
 }
 
+fn default_port() -> u16 {
+    8081
+}
+
+fn default_daily_time() -> String {
+    "08:00".to_string()
+}
+
+/// Settings for an app-managed local Telegram Bot API server. Running one lifts
+/// the public API's 20 MB download cap to 2 GB, so large videos can be saved.
+/// A single server instance serves every bot.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ServerConfig {
+    /// Whether the app should spawn and manage a local server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the `telegram-bot-api` binary. Unset/empty = auto-detect from
+    /// common install locations and `PATH`.
+    #[serde(default)]
+    pub bin_path: Option<String>,
+    /// HTTP port the local server listens on.
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Telegram `api_id` from my.telegram.org. Not secret.
+    #[serde(default)]
+    pub api_id: i64,
+    /// Telegram `api_hash`. Secret: stored in the Keychain, never serialized to
+    /// `bots.json`. Hydrated into memory at startup.
+    #[serde(default, skip_serializing)]
+    pub api_hash: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bin_path: None,
+            port: default_port(),
+            api_id: 0,
+            api_hash: String::new(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// The port the server actually listens on. A `0` (e.g. a hand-edited
+    /// config) falls back to the default so the spawned server and the URL bots
+    /// are routed to can never disagree.
+    pub fn effective_port(&self) -> u16 {
+        if self.port == 0 {
+            default_port()
+        } else {
+            self.port
+        }
+    }
+}
+
 /// One bot bound to one markdown file.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BotConfig {
@@ -25,17 +82,34 @@ pub struct BotConfig {
     /// Telegram numeric user id allowed to write. 0 = allow anyone (not recommended).
     #[serde(default)]
     pub allowed_user_id: i64,
+    /// Base URL of the Telegram Bot API. Unset/empty uses the public
+    /// `https://api.telegram.org`, which caps file downloads at 20 MB. Point this
+    /// at a self-hosted local Bot API server (e.g. `http://localhost:8081`) to
+    /// raise the limit to 2 GB so large videos can be saved.
+    #[serde(default)]
+    pub api_base: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Optional global hotkey for local quick-capture, e.g. "CmdOrCtrl+Shift+KeyI".
     #[serde(default)]
     pub shortcut: Option<String>,
+    /// When true, the bot sends the markdown file's exact contents back to the
+    /// owner once a day at `daily_time`. Requires `allowed_user_id` to be set (in
+    /// a private chat the user id is also the chat id we send to).
+    #[serde(default)]
+    pub daily_send: bool,
+    /// Local time of day for the daily send, "HH:MM" (24-hour). Defaults to 08:00.
+    #[serde(default = "default_daily_time")]
+    pub daily_time: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub bots: Vec<BotConfig>,
+    /// Global settings for the app-managed local Bot API server.
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 impl Config {

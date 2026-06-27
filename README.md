@@ -12,8 +12,10 @@ You ──Telegram──▶ Bot "Ideas"  ──▶ /Users/you/notes/ideas.md
 You ──Telegram──▶ Bot "Tasks"  ──▶ /Users/you/notes/tasks.md
 ```
 
-The app uses **long polling**, so there is no server, no open port, and no domain to
-configure — it just dials out to Telegram. Perfect for a Mac mini at home.
+The app uses **long polling**, so there is no inbound server, no public port, and no
+domain to configure — it just dials out to Telegram. Perfect for a Mac mini at home.
+(Optionally it can run a *local* Telegram Bot API server bound to loopback to lift the
+20 MB download cap — see "Local Bot API server" below.)
 
 ---
 
@@ -122,6 +124,20 @@ hotkey works whether or not the bot's Telegram side is enabled.
 > can listen for global hotkeys — approve Notekeeper in
 > System Settings → Privacy & Security.
 
+## Daily send-back (file → you, every morning)
+
+Each bot can also push **the other way**: tick **Send this file to me every day at**
+in the bot's edit form and pick a time. Once a day at that local time the bot sends
+the markdown file's **exact contents** back to you in Telegram (split across multiple
+messages if it's longer than Telegram's per-message limit).
+
+- It sends to the account in **Your Telegram user ID**, so that field must be set
+  (it's also the chat the bot replies in). Leaving it at `0` disables the daily send.
+- Only sends when the bot is **enabled** — it rides along with the poll loop.
+- If the file is empty (or missing) that day, nothing is sent.
+- Starting the app *after* the scheduled time won't trigger a catch-up send; it waits
+  until the next day's slot.
+
 ## How messages are written
 
 Each message becomes one timestamped line, appended to the file:
@@ -175,6 +191,7 @@ notekeeper/
    └─ src/
       ├─ main.rs             # Tauri commands + tray + lifecycle
       ├─ bots.rs             # Telegram long-poll engine, timestamped append
+      ├─ server.rs           # optional app-managed local Bot API server
       ├─ secrets.rs          # bot tokens in the macOS Keychain
       └─ config.rs           # load/save bots.json (no tokens)
 ```
@@ -185,5 +202,27 @@ notekeeper/
   token elsewhere (e.g. a second copy of the app) or Telegram returns a 409 conflict.
 - Leaving the user ID at `0` lets **anyone** who finds the bot write to your file — set
   your real ID unless you have a reason not to.
-- Telegram caps bot file downloads at ~20 MB. A larger file can't be fetched; instead of
-  saving it, the bot appends a `could not save file:` note and moves on.
+- Telegram's **public** Bot API caps file downloads at ~20 MB. Over the public API a
+  larger file can't be fetched; instead of saving it, the bot appends a
+  `could not save file:` note and moves on. Run the optional **local Bot API server**
+  (below) to raise this to 2 GB.
+
+## Local Bot API server (optional, lifts the 20 MB cap)
+
+To receive files larger than 20 MB (most videos), the app can spawn and manage a local
+[`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) server in `--local` mode,
+which raises the download limit to 2 GB and writes files straight to disk.
+
+1. Install it once, e.g. `brew install telegram-bot-api`.
+2. Get an `api_id` and `api_hash` from **my.telegram.org → API development tools**.
+3. In the app, click **Local server**, tick "Run the local server…", enter the
+   `api_id`/`api_hash`, and save. The `api_hash` is stored in the macOS Keychain.
+
+The server binds to **loopback only** (`127.0.0.1`), so it isn't reachable from other
+machines, and it's killed when the app quits. All enabled bots are routed through it
+while it's running; if it's enabled but fails to start, the failure is shown in the
+**Local server** dialog and bots fall back to the public API automatically.
+
+> A bot already used with the public API must be logged out of it before a local server
+> can take over — send `https://api.telegram.org/bot<token>/logOut` once per bot. It logs
+> back in automatically if you later disable the local server.

@@ -11,6 +11,20 @@ use keyring::Entry;
 /// Keychain service name. Matches the app's bundle identifier.
 const SERVICE: &str = "com.notekeeper.app";
 
+/// Fixed Keychain key for the global local-server `api_hash`. The leading
+/// underscores keep it from ever colliding with a bot's UUID.
+const SERVER_HASH_KEY: &str = "__server_api_hash__";
+
+/// Read the local-server `api_hash` from the Keychain.
+pub fn get_server_api_hash() -> Option<String> {
+    get_token(SERVER_HASH_KEY)
+}
+
+/// Store (or replace) the local-server `api_hash` in the Keychain.
+pub fn set_server_api_hash(hash: &str) -> Result<(), String> {
+    set_token(SERVER_HASH_KEY, hash)
+}
+
 /// Read a bot's token from the Keychain. Returns `None` if there is no entry
 /// (or the Keychain is unavailable).
 pub fn get_token(id: &str) -> Option<String> {

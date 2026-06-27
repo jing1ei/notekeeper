@@ -14,7 +14,9 @@ status.json
 .DS_Store
 .AppleDouble
 .LSOverride
-Icon?
+# NOTE: the usual "Icon?" rule for the legacy macOS resource file is omitted on
+# purpose — with core.ignorecase=true it also matches the src-tauri/icons/
+# directory, which silently kept the committed icon set out of the repo.
 
 # Editor / IDE
 .idea/

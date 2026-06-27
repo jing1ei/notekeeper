@@ -15,9 +15,12 @@ mitigation will be coordinated before any public disclosure.
 
 ## Scope and threat model
 
-Notekeeper is a local, single-user macOS menu bar app. It does **not** run a
-server or open any inbound ports — it only dials out to Telegram over HTTPS via
-long polling. The main assets to protect are:
+Notekeeper is a local, single-user macOS menu bar app. By default it opens **no
+inbound ports** and exposes nothing to the network — it only dials out to
+Telegram over HTTPS via long polling. The optional local Bot API server, when
+enabled, runs a `telegram-bot-api` child process bound to **loopback only**
+(`127.0.0.1`), so it is reachable from this Mac alone and never from the network;
+it is terminated when the app quits. The main assets to protect are:
 
 - **Bot tokens** — stored in the macOS **Keychain** (service
   `com.notekeeper.app`), not in `bots.json`. Tokens are redacted from any error

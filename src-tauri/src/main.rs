@@ -3,13 +3,14 @@
 mod bots;
 mod config;
 mod secrets;
+mod server;
 
 use bots::{run_bot, BotHandle, BotStatus, StatusMap};
 use chrono::Local;
-use config::{BotConfig, Config};
+use config::{BotConfig, Config, ServerConfig};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -32,6 +33,43 @@ pub struct AppState {
     pub shortcuts: Mutex<HashMap<Shortcut, String>>,
     /// Which bot the quick-capture window should write to right now.
     pub quick_target: Mutex<Option<(String, String)>>,
+    /// The app-managed local Bot API server, when running. A std Mutex (not the
+    /// async one) so it can be locked and the child killed synchronously from
+    /// the app's exit handler.
+    pub server: std::sync::Mutex<Option<server::ServerHandle>>,
+    /// The last error from trying to start the managed local server (cleared once
+    /// it starts, or when it's disabled). Surfaced in the server settings UI so a
+    /// startup failure stays visible instead of being overwritten by per-bot
+    /// status once the bots fall back to the public API.
+    pub server_error: std::sync::Mutex<Option<String>>,
+}
+
+/// Resolve the Bot API base a given bot should use: an explicit per-bot
+/// override wins; otherwise the managed local server when it's enabled *and
+/// actually running*; otherwise `None`, meaning the public Telegram API.
+///
+/// `server_running` must reflect whether the managed process is up: routing a
+/// bot at the local server while it's down (e.g. it failed to start) would point
+/// every request at a dead loopback port instead of falling back to the public
+/// API, so the bot would break entirely rather than degrade gracefully.
+fn effective_api_base(
+    bot: &BotConfig,
+    server: &ServerConfig,
+    server_running: bool,
+) -> Option<String> {
+    if bot
+        .api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        return bot.api_base.clone();
+    }
+    if server.enabled && server_running {
+        return Some(server::local_url(server.effective_port()));
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -44,8 +82,11 @@ struct BotView {
     file: String,
     files_dir: Option<String>,
     allowed_user_id: i64,
+    api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
+    daily_send: bool,
+    daily_time: String,
     status: BotStatus,
 }
 
@@ -76,12 +117,23 @@ async fn start_bot(bot: &BotConfig, state: &AppState) {
     let file = bot.file.clone();
     let files_dir = bot.files_dir.clone();
     let allowed = bot.allowed_user_id;
+    let daily_send = bot.daily_send;
+    let daily_time = bot.daily_time.clone();
+    // Use the managed local server (or a per-bot override) when configured.
+    // Only route to the local server when its process is actually up, so a bot
+    // falls back to the public API instead of a dead port if it failed to start.
+    let api_base = {
+        let server_running = state.server.lock().unwrap().is_some();
+        let cfg = state.config.lock().await;
+        effective_api_base(bot, &cfg.server, server_running)
+    };
     let status = state.status.clone();
     let status_path = state.status_path.clone();
     let client = state.http.clone();
     tauri::async_runtime::spawn(async move {
         run_bot(
-            id, token, file, files_dir, allowed, status, status_path, client, rx,
+            id, token, file, files_dir, allowed, api_base, daily_send, daily_time, status,
+            status_path, client, rx,
         )
         .await;
     });
@@ -93,6 +145,59 @@ async fn stop_bot(id: &str, state: &AppState) {
     }
     if let Some(s) = state.status.lock().await.get_mut(id) {
         s.running = false;
+    }
+}
+
+// ---- local Bot API server lifecycle ----
+
+/// Where the managed server stores its data (downloaded files live here).
+fn server_data_dir(state: &AppState) -> PathBuf {
+    state
+        .config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("bot-api")
+}
+
+/// Tear down any running managed server, then start a fresh one if the current
+/// config enables it. Returns an error (with the reason) when an enabled server
+/// fails to start, leaving no server running.
+async fn restart_local_server(state: &AppState) -> Result<(), String> {
+    // Dropping the old handle kills its child process.
+    {
+        let mut guard = state.server.lock().unwrap();
+        *guard = None;
+    }
+    let cfg = { state.config.lock().await.server.clone() };
+    if !cfg.enabled {
+        *state.server_error.lock().unwrap() = None;
+        return Ok(());
+    }
+    let data_dir = server_data_dir(state);
+    match server::start(&cfg, &data_dir) {
+        Ok(handle) => {
+            *state.server.lock().unwrap() = Some(handle);
+            *state.server_error.lock().unwrap() = None;
+            Ok(())
+        }
+        Err(e) => {
+            // Keep the reason so the settings UI can show why the server is down.
+            *state.server_error.lock().unwrap() = Some(e.clone());
+            Err(e)
+        }
+    }
+}
+
+/// Restart every bot so they pick up a changed API base (e.g. after the local
+/// server is toggled). Enabled bots are (re)started; disabled ones stopped.
+async fn restart_all_bots(state: &AppState) {
+    let bots = { state.config.lock().await.bots.clone() };
+    for b in &bots {
+        if b.enabled {
+            start_bot(b, state).await;
+        } else {
+            stop_bot(&b.id, state).await;
+        }
     }
 }
 
@@ -164,8 +269,11 @@ async fn get_bots(state: State<'_, AppState>) -> Result<Vec<BotView>, String> {
             file: b.file.clone(),
             files_dir: b.files_dir.clone(),
             allowed_user_id: b.allowed_user_id,
+            api_base: b.api_base.clone(),
             enabled: b.enabled,
             shortcut: b.shortcut.clone(),
+            daily_send: b.daily_send,
+            daily_time: b.daily_time.clone(),
             status: status.get(&b.id).cloned().unwrap_or_default(),
         })
         .collect();
@@ -181,8 +289,11 @@ async fn add_bot(
     file: String,
     files_dir: Option<String>,
     allowed_user_id: i64,
+    api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
+    daily_send: bool,
+    daily_time: String,
 ) -> Result<(), String> {
     let bot = BotConfig {
         id: Uuid::new_v4().to_string(),
@@ -191,8 +302,11 @@ async fn add_bot(
         file,
         files_dir,
         allowed_user_id,
+        api_base,
         enabled,
         shortcut,
+        daily_send,
+        daily_time,
     };
     // Store the token in the Keychain before persisting the (token-less) config.
     secrets::set_token(&bot.id, &bot.token)?;
@@ -224,8 +338,11 @@ async fn update_bot(
     file: String,
     files_dir: Option<String>,
     allowed_user_id: i64,
+    api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
+    daily_send: bool,
+    daily_time: String,
 ) -> Result<(), String> {
     let new_token = token.trim().to_string();
     let updated;
@@ -251,8 +368,11 @@ async fn update_bot(
         b.file = file;
         b.files_dir = files_dir;
         b.allowed_user_id = allowed_user_id;
+        b.api_base = api_base;
         b.enabled = enabled;
         b.shortcut = shortcut;
+        b.daily_send = daily_send;
+        b.daily_time = daily_time;
         updated = b.clone();
         if let Err(e) = config.save(&state.config_path) {
             // Restore in-memory state, and the Keychain too if we'd replaced the
@@ -305,6 +425,8 @@ async fn remove_bot(
     // Persist so the removed bot's counters/offset don't linger in status.json
     // and get reloaded as an orphan entry on the next launch.
     bots::persist_status(&state.status_path, &state.status).await;
+    // Drop any leftover pending-download journal for the removed bot.
+    bots::remove_journal(&state.status_path, &id);
     sync_shortcuts(&app).await;
     Ok(())
 }
@@ -336,8 +458,93 @@ async fn set_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> R
 }
 
 #[tauri::command]
-async fn validate_token(state: State<'_, AppState>, token: String) -> Result<String, String> {
-    bots::get_me(&state.http, &token).await
+async fn validate_token(
+    state: State<'_, AppState>,
+    token: String,
+    api_base: Option<String>,
+) -> Result<String, String> {
+    let base = bots::resolve_api_base(api_base.as_deref());
+    bots::get_me(&state.http, &base, &token).await
+}
+
+#[derive(Serialize)]
+struct ServerView {
+    enabled: bool,
+    bin_path: Option<String>,
+    port: u16,
+    api_id: i64,
+    /// Whether an api_hash is stored, so the form can show "leave blank to keep".
+    has_api_hash: bool,
+    /// The binary path the app would actually use (auto-detected when unset), or
+    /// null if none was found — surfaced as a hint in the UI.
+    detected_bin: Option<String>,
+    /// Whether the managed server process is currently running.
+    running: bool,
+    /// Why the managed server isn't running, if it was enabled but failed to
+    /// start. Null when it's running or disabled.
+    last_error: Option<String>,
+}
+
+#[tauri::command]
+async fn get_server_config(state: State<'_, AppState>) -> Result<ServerView, String> {
+    let cfg = { state.config.lock().await.server.clone() };
+    let detected = server::locate_binary(cfg.bin_path.as_deref()).map(|p| p.display().to_string());
+    let running = state.server.lock().unwrap().is_some();
+    let last_error = state.server_error.lock().unwrap().clone();
+    Ok(ServerView {
+        enabled: cfg.enabled,
+        bin_path: cfg.bin_path.clone(),
+        port: cfg.port,
+        api_id: cfg.api_id,
+        has_api_hash: !cfg.api_hash.is_empty(),
+        detected_bin: detected,
+        running,
+        last_error,
+    })
+}
+
+#[tauri::command]
+async fn update_server_config(
+    state: State<'_, AppState>,
+    enabled: bool,
+    bin_path: Option<String>,
+    port: u16,
+    api_id: i64,
+    api_hash: Option<String>,
+) -> Result<(), String> {
+    {
+        let mut config = state.config.lock().await;
+        let prev = config.server.clone();
+        // A blank api_hash means "keep the stored one". Write to the Keychain
+        // before mutating in-memory state so a Keychain failure changes nothing.
+        if let Some(h) = api_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            secrets::set_server_api_hash(h)?;
+            config.server.api_hash = h.to_string();
+        }
+        config.server.enabled = enabled;
+        config.server.bin_path = bin_path
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        config.server.port = port;
+        config.server.api_id = api_id;
+        if let Err(e) = config.save(&state.config_path) {
+            config.server = prev;
+            return Err(e.to_string());
+        }
+    }
+    // Apply the new settings: (re)start or stop the server, then point bots at it.
+    // Restart the bots *regardless* of whether the server came up — restarting
+    // the old server first tears it down, so if the new one fails to start we
+    // must still re-resolve each bot's API base (it falls back to the public API
+    // when the server is down) instead of leaving bots aimed at a dead local
+    // port. The start error is surfaced afterwards.
+    let server_result = restart_local_server(state.inner()).await;
+    restart_all_bots(state.inner()).await;
+    server_result
 }
 
 /// Async so the blocking native dialog runs off the main thread (calling the
@@ -466,12 +673,13 @@ async fn tray_signature(app: &tauri::AppHandle) -> String {
     for b in &config.bots {
         let st = status.get(&b.id).cloned().unwrap_or_default();
         sig.push_str(&format!(
-            "{}|{}|{}|{}|{}|{};",
+            "{}|{}|{}|{}|{}|{}|{};",
             b.id,
             b.name,
             b.enabled,
             st.running,
             st.last_error.is_some(),
+            st.last_daily_error.is_some(),
             st.message_count,
         ));
     }
@@ -501,19 +709,20 @@ async fn update_tray(app: &tauri::AppHandle) {
     let mut status_items: Vec<MenuItem<tauri::Wry>> = Vec::new();
     for b in &bots {
         let st = statuses.get(&b.id).cloned().unwrap_or_default();
+        let has_error = st.last_error.is_some() || st.last_daily_error.is_some();
         let icon = if !b.enabled {
             "⚪"
-        } else if st.last_error.is_some() {
+        } else if has_error {
             "🔴"
         } else if st.running {
             "🟢"
         } else {
             "🟡"
         };
-        if b.enabled && st.running && st.last_error.is_none() {
+        if b.enabled && st.running && !has_error {
             running += 1;
         }
-        if b.enabled && st.last_error.is_some() {
+        if b.enabled && has_error {
             errors += 1;
         }
         let label = format!("{} {}  ·  {} saved", icon, b.name, st.message_count);
@@ -569,6 +778,8 @@ fn main() {
             remove_bot,
             set_enabled,
             validate_token,
+            get_server_config,
+            update_server_config,
             pick_markdown_file,
             pick_folder,
             open_note_file,
@@ -594,6 +805,8 @@ fn main() {
             if secrets::hydrate_tokens(&mut config) {
                 let _ = config.save(&config_path);
             }
+            // The server api_hash lives in the Keychain, not bots.json.
+            config.server.api_hash = secrets::get_server_api_hash().unwrap_or_default();
 
             app.manage(AppState {
                 config_path: config_path.clone(),
@@ -604,6 +817,8 @@ fn main() {
                 http: reqwest::Client::new(),
                 shortcuts: Mutex::new(HashMap::new()),
                 quick_target: Mutex::new(None),
+                server: std::sync::Mutex::new(None),
+                server_error: std::sync::Mutex::new(None),
             });
 
             // Tray icon with an initial menu.
@@ -644,6 +859,13 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 {
                     let state = handle.state::<AppState>();
+                    // Bring up the managed local server first so bots can reach
+                    // it. If it fails, the reason is stored in `server_error`
+                    // (shown in the server settings UI) and bots transparently
+                    // fall back to the public API rather than a dead local port.
+                    if let Err(e) = restart_local_server(state.inner()).await {
+                        eprintln!("local Bot API server: {}", e);
+                    }
                     let bots: Vec<BotConfig> = {
                         let c = state.config.lock().await;
                         c.bots.clone()
@@ -666,6 +888,15 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running notekeeper");
+        .build(tauri::generate_context!())
+        .expect("error while running notekeeper")
+        .run(|app_handle, event| {
+            // Kill the managed server when the app exits so it isn't orphaned.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<AppState>();
+                if let Ok(mut guard) = state.server.lock() {
+                    *guard = None;
+                }
+            }
+        });
 }

@@ -43,12 +43,21 @@
   </div>
 
 <script>
-  const { invoke } = window.__TAURI__.core;
-  const { getCurrentWindow } = window.__TAURI__.window;
-  const win = getCurrentWindow();
+  // This window only ever loads inside the Notekeeper app, but guard the Tauri
+  // bridge anyway so opening quick.html as a plain file shows a message instead
+  // of throwing on the first property access and rendering a blank box.
   const input = document.getElementById('input');
   const targetEl = document.getElementById('target');
   const hintEl = document.getElementById('hint');
+  if (!(window.__TAURI__ && window.__TAURI__.core)) {
+    targetEl.textContent = 'not in app';
+    hintEl.textContent = 'Open Notekeeper from the menu bar.';
+    input.disabled = true;
+    throw new Error('Notekeeper backend not attached');
+  }
+  const { invoke } = window.__TAURI__.core;
+  const { getCurrentWindow } = window.__TAURI__.window;
+  const win = getCurrentWindow();
   let target = null;
 
   function applyTarget(t) {

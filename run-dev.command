@@ -45,7 +45,19 @@ if [ "$fetched" = false ]; then
 fi
 
 echo
-echo "✅ All crates present. Launching the app…"
+echo "✅ All crates present."
+echo
+
+# Generate the icon set if it's missing (a fresh clone may not have it). Tauri
+# reads these at dev-run time for the window/tray icon, so without them the app
+# fails to start.
+if [ ! -d "src-tauri/icons" ]; then
+  echo "ℹ️  Generating app icons from app-icon.png…"
+  cargo tauri icon app-icon.png || true
+  echo
+fi
+
+echo "Launching the app…"
 echo
 echo "WHEN THE APP STARTS:"
 echo "  1. No Dock icon — click the Notekeeper icon in the menu bar (top-right),"

@@ -7,7 +7,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
+
+/// getFile over the public Bot API only serves files up to 20 MB. A self-hosted
+/// local server lifts this, so we only pre-empt the limit when talking to the
+/// public API.
+///
+/// Telegram documents this as 20 MB in *decimal* (20,000,000 bytes), not 20 MiB.
+/// Using the decimal value keeps our pre-emptive "too big" message in step with
+/// the server's real cutoff — a file in the 20,000,000..20,971,520 window would
+/// otherwise slip past this check and come back as a generic getFile failure
+/// instead of the friendly "over the 20 MB limit" note.
+const PUBLIC_DOWNLOAD_LIMIT: i64 = 20_000_000;
 
 /// Live status for one bot, surfaced to the UI and the tray. The message
 /// counters and the long-poll `offset` are persisted across restarts; the
@@ -20,6 +31,11 @@ pub struct BotStatus {
     pub username: Option<String>,
     #[serde(default, skip_deserializing)]
     pub last_error: Option<String>,
+    /// Error from the daily send-back, kept separate from `last_error` so the
+    /// poll loop (which clears `last_error` on every successful getUpdates) can't
+    /// wipe it within seconds and hide a failed daily send. Transient.
+    #[serde(default, skip_deserializing)]
+    pub last_daily_error: Option<String>,
     #[serde(default)]
     pub last_message_at: Option<String>,
     #[serde(default)]
@@ -71,9 +87,101 @@ async fn set_status<F: FnOnce(&mut BotStatus)>(status: &StatusMap, id: &str, f: 
     f(entry);
 }
 
+/// A file download that's been acknowledged to Telegram but not yet saved.
+///
+/// Downloads run on a background worker so a large (slow) file can't block the
+/// bot's poll loop from receiving later messages or honouring a stop request.
+/// Because the update is acked to Telegram as soon as it's enqueued (so the
+/// long-poll keeps flowing), the job is also written to an on-disk journal —
+/// otherwise a crash mid-download would lose the file with no way to re-fetch
+/// it. The journal is replayed on the next start.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingDownload {
+    update_id: i64,
+    file_id: String,
+    file_name: Option<String>,
+    caption: String,
+    chat_id: i64,
+    message_id: i64,
+}
+
+/// The pending-download journal for one bot, shared between the poll loop (which
+/// appends jobs) and the worker (which removes them once saved).
+type Journal = Arc<Mutex<Vec<PendingDownload>>>;
+
+/// Path to a bot's pending-download journal, kept beside `status.json`.
+fn journal_path(status_path: &Path, id: &str) -> PathBuf {
+    let dir = status_path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("pending-{}.json", id))
+}
+
+/// Load a bot's pending-download journal; an absent or unreadable file is an
+/// empty journal.
+fn load_journal(path: &Path) -> Vec<PendingDownload> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Delete a bot's pending-download journal — called when the bot is removed so
+/// a stale journal can't be replayed against a bot that no longer exists.
+pub fn remove_journal(status_path: &Path, id: &str) {
+    let _ = std::fs::remove_file(journal_path(status_path, id));
+}
+
+/// Persist the journal atomically.
+async fn persist_journal(path: &Path, journal: &Journal) {
+    let snapshot = { journal.lock().await.clone() };
+    if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
+        let _ = atomic_write(path, text.as_bytes());
+    }
+}
+
+/// Format a byte count for human-readable status/ack messages.
+///
+/// Uses decimal (SI) units — 1 MB = 1,000,000 bytes — to stay consistent with
+/// `PUBLIC_DOWNLOAD_LIMIT` (the 20 MB Bot API cap is decimal too) and with macOS
+/// Finder. Binary units here would make a file that's just over the limit read as
+/// e.g. "19.1 MB — over the 20 MB limit", which looks self-contradictory.
+fn human_size(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "unknown size".to_string();
+    }
+    const KB: f64 = 1000.0;
+    const MB: f64 = KB * 1000.0;
+    const GB: f64 = MB * 1000.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// The public Telegram Bot API. Used when a bot has no custom `api_base`.
+pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
+/// Normalize a configured API base into a usable origin. Falls back to the
+/// public API when unset/blank, and trims any trailing slash so URL building
+/// can always join with a single `/`.
+pub fn resolve_api_base(configured: Option<&str>) -> String {
+    let trimmed = configured.map(str::trim).unwrap_or("");
+    let base = if trimmed.is_empty() {
+        DEFAULT_API_BASE
+    } else {
+        trimmed
+    };
+    base.trim_end_matches('/').to_string()
+}
+
 /// Call getMe to validate a token and return the bot's @username.
-pub async fn get_me(client: &reqwest::Client, token: &str) -> Result<String, String> {
-    let url = format!("https://api.telegram.org/bot{}/getMe", token);
+pub async fn get_me(client: &reqwest::Client, base: &str, token: &str) -> Result<String, String> {
+    let url = format!("{}/bot{}/getMe", base, token);
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(15))
@@ -133,15 +241,26 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// A downloadable attachment pulled from a message.
+struct Attachment {
+    file_id: String,
+    file_name: Option<String>,
+    /// Telegram-reported size in bytes, or 0 when the message omits it.
+    file_size: i64,
+}
+
 /// Pull the first downloadable attachment out of a message, returning its
-/// Telegram `file_id` and a suggested filename (when the message provides one).
-/// Checks the common attachment kinds in priority order.
-fn extract_attachment(msg: &Value) -> Option<(String, Option<String>)> {
+/// Telegram `file_id`, a suggested filename (when the message provides one) and
+/// its reported size. Checks the common attachment kinds in priority order.
+fn extract_attachment(msg: &Value) -> Option<Attachment> {
     for key in ["document", "video", "audio", "voice", "animation", "video_note"] {
         if let Some(obj) = msg.get(key) {
             if let Some(id) = obj["file_id"].as_str() {
-                let name = obj["file_name"].as_str().map(|s| s.to_string());
-                return Some((id.to_string(), name));
+                return Some(Attachment {
+                    file_id: id.to_string(),
+                    file_name: obj["file_name"].as_str().map(|s| s.to_string()),
+                    file_size: obj["file_size"].as_i64().unwrap_or(0),
+                });
             }
         }
     }
@@ -149,13 +268,21 @@ fn extract_attachment(msg: &Value) -> Option<(String, Option<String>)> {
     if let Some(sizes) = msg["photo"].as_array() {
         if let Some(largest) = sizes.last() {
             if let Some(id) = largest["file_id"].as_str() {
-                return Some((id.to_string(), None));
+                return Some(Attachment {
+                    file_id: id.to_string(),
+                    file_name: None,
+                    file_size: largest["file_size"].as_i64().unwrap_or(0),
+                });
             }
         }
     }
     // Stickers are .webp (or .tgs/.webm for animated) with no file_name.
     if let Some(id) = msg["sticker"]["file_id"].as_str() {
-        return Some((id.to_string(), None));
+        return Some(Attachment {
+            file_id: id.to_string(),
+            file_name: None,
+            file_size: msg["sticker"]["file_size"].as_i64().unwrap_or(0),
+        });
     }
     None
 }
@@ -199,13 +326,14 @@ impl DownloadError {
 /// Download a Telegram file by `file_id` into `dir`, returning the saved path.
 async fn download_attachment(
     client: &reqwest::Client,
+    base: &str,
     token: &str,
     file_id: &str,
     file_name: Option<&str>,
     dir: &Path,
 ) -> Result<PathBuf, DownloadError> {
     // getFile resolves a file_id to a temporary download path on Telegram's servers.
-    let get_url = format!("https://api.telegram.org/bot{}/getFile", token);
+    let get_url = format!("{}/bot{}/getFile", base, token);
     let resp = client
         .get(&get_url)
         .query(&[("file_id", file_id)])
@@ -233,9 +361,36 @@ async fn download_attachment(
     // Fall back to the basename Telegram reports when the message had no file_name.
     let name = file_name
         .map(|s| s.to_string())
-        .unwrap_or_else(|| file_path.rsplit('/').next().unwrap_or("file").to_string());
+        .unwrap_or_else(|| {
+            file_path
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("file")
+                .to_string()
+        });
 
-    let dl_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| DownloadError::transient(e.to_string()))?;
+    let dest = unique_dest(dir, &name);
+
+    // A self-hosted local Bot API server (run with `--local`) returns `file_path`
+    // as an absolute path to the already-downloaded file on disk rather than a
+    // relative URL. In that case copy it straight off disk — there's no 20 MB cap
+    // and no second HTTP round trip. Otherwise fetch it over HTTP as usual.
+    if Path::new(&file_path).is_absolute() {
+        tokio::fs::copy(&file_path, &dest)
+            .await
+            .map_err(|e| DownloadError::permanent(format!("could not read local file: {}", e)))?;
+        // The local Bot API server doesn't auto-delete downloaded files — without
+        // this its data dir grows unbounded as large videos pile up. We've copied
+        // the file out, so the server's copy is safe to remove (best-effort).
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return Ok(dest);
+    }
+
+    let dl_url = format!("{}/file/bot{}/{}", base, token, file_path);
     let resp = client
         .get(&dl_url)
         .timeout(Duration::from_secs(300))
@@ -259,18 +414,14 @@ async fn download_attachment(
         .await
         .map_err(|e| DownloadError::transient(scrub(e.to_string(), token)))?;
 
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| DownloadError::transient(e.to_string()))?;
-    let dest = unique_dest(dir, &name);
     tokio::fs::write(&dest, &bytes)
         .await
         .map_err(|e| DownloadError::transient(e.to_string()))?;
     Ok(dest)
 }
 
-async fn react(client: &reqwest::Client, token: &str, chat_id: i64, message_id: i64) {
-    let url = format!("https://api.telegram.org/bot{}/setMessageReaction", token);
+async fn react(client: &reqwest::Client, base: &str, token: &str, chat_id: i64, message_id: i64) {
+    let url = format!("{}/bot{}/setMessageReaction", base, token);
     let body = serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
@@ -284,6 +435,293 @@ async fn react(client: &reqwest::Client, token: &str, chat_id: i64, message_id: 
         .await;
 }
 
+/// Send a plain text message back to the user (e.g. a "downloading…" ack or an
+/// error). Best-effort: failures are ignored so they can't stall the loop.
+async fn send_message(client: &reqwest::Client, base: &str, token: &str, chat_id: i64, text: &str) {
+    let url = format!("{}/bot{}/sendMessage", base, token);
+    let body = serde_json::json!({ "chat_id": chat_id, "text": text });
+    let _ = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+}
+
+/// Telegram caps a single text message at 4096 UTF-16 code units. We split a
+/// little under that; since a string's byte length is always >= its UTF-16
+/// length, staying under this many bytes guarantees we're under the real cap.
+const TELEGRAM_MSG_LIMIT: usize = 4000;
+
+/// Split text into Telegram-sized chunks, preferring line boundaries so the
+/// content stays readable. A single line longer than the limit is hard-split on
+/// char boundaries. Concatenating the chunks reproduces the input exactly.
+fn chunk_text(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        if line.len() > TELEGRAM_MSG_LIMIT {
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            let mut rest = line;
+            while rest.len() > TELEGRAM_MSG_LIMIT {
+                let mut idx = TELEGRAM_MSG_LIMIT;
+                while !rest.is_char_boundary(idx) {
+                    idx -= 1;
+                }
+                chunks.push(rest[..idx].to_string());
+                rest = &rest[idx..];
+            }
+            cur.push_str(rest);
+            continue;
+        }
+        if cur.len() + line.len() > TELEGRAM_MSG_LIMIT {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Send one text message, returning whether Telegram accepted it. Unlike
+/// `send_message` (fire-and-forget) the daily digest needs to know if a chunk
+/// failed so it can surface the error and stop mid-file rather than send a
+/// partial digest silently.
+async fn send_message_checked(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> bool {
+    let url = format!("{}/bot{}/sendMessage", base, token);
+    let body = serde_json::json!({ "chat_id": chat_id, "text": text });
+    match client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+    {
+        Ok(resp) => resp
+            .json::<Value>()
+            .await
+            .map(|j| j["ok"].as_bool() == Some(true))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Parse an "HH:MM" string into (hour, minute), clamped to valid ranges.
+/// Falls back to 08:00 on anything unparseable.
+fn parse_hhmm(s: &str) -> (u32, u32) {
+    let mut parts = s.trim().splitn(2, ':');
+    let h = parts
+        .next()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .unwrap_or(8);
+    let m = parts
+        .next()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    (h.min(23), m.min(59))
+}
+
+/// Once a day at `daily_time` (local), send the markdown file's exact contents
+/// back to the owner (`chat_id`). Runs until `stop_rx` flips to true.
+///
+/// Rather than sleeping for the whole interval (which a laptop sleep or a clock
+/// change would throw off), it wakes every 30s, checks the wall clock, and fires
+/// once per calendar day when the scheduled minute has arrived. If the bot
+/// starts after today's send time, today is treated as already done so there's
+/// no surprise catch-up send on launch.
+#[allow(clippy::too_many_arguments)]
+async fn daily_send_loop(
+    id: String,
+    base: String,
+    token: String,
+    file: String,
+    chat_id: i64,
+    daily_time: String,
+    status: StatusMap,
+    client: reqwest::Client,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    use chrono::Timelike;
+    let (hh, mm) = parse_hhmm(&daily_time);
+
+    let now = Local::now();
+    let past_today = now.hour() > hh || (now.hour() == hh && now.minute() >= mm);
+    let mut last_sent: Option<chrono::NaiveDate> = if past_today {
+        Some(now.date_naive())
+    } else {
+        None
+    };
+
+    loop {
+        tokio::select! {
+            // `changed()` errors when the sender is dropped: treat that as a stop
+            // too, otherwise the arm would complete instantly every iteration and
+            // spin the loop instead of waking once every 30s.
+            res = stop_rx.changed() => { if res.is_err() || *stop_rx.borrow() { break; } }
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        let now = Local::now();
+        let today = now.date_naive();
+        if last_sent == Some(today) {
+            continue;
+        }
+        let due = now.hour() > hh || (now.hour() == hh && now.minute() >= mm);
+        if !due {
+            continue;
+        }
+
+        // Mark before sending so a failure can't spin-resend in a tight loop;
+        // it'll simply try again tomorrow.
+        last_sent = Some(today);
+
+        match tokio::fs::read_to_string(&file).await {
+            Ok(content) => {
+                if content.trim().is_empty() {
+                    continue; // nothing to send today
+                }
+                let mut ok = true;
+                for chunk in chunk_text(&content) {
+                    if !send_message_checked(&client, &base, &token, chat_id, &chunk).await {
+                        ok = false;
+                        break;
+                    }
+                }
+                set_status(&status, &id, |s| {
+                    s.last_daily_error = if ok {
+                        None
+                    } else {
+                        Some("daily send failed (Telegram rejected message)".to_string())
+                    };
+                })
+                .await;
+            }
+            Err(e) => {
+                set_status(&status, &id, |s| {
+                    s.last_daily_error = Some(format!("daily send: cannot read file: {}", e));
+                })
+                .await;
+            }
+        }
+    }
+}
+
+/// Background worker that drains a bot's download queue. Runs one download at a
+/// time (preserving order), retrying transient failures until they succeed, the
+/// failure turns out permanent, or the bot stops. Each finished or permanently
+/// failed job is removed from the journal so it isn't replayed next start.
+#[allow(clippy::too_many_arguments)]
+async fn download_worker(
+    id: String,
+    base: String,
+    token: String,
+    file: String,
+    save_dir: PathBuf,
+    status: StatusMap,
+    status_path: PathBuf,
+    journal: Journal,
+    journal_file: PathBuf,
+    client: reqwest::Client,
+    mut rx: mpsc::UnboundedReceiver<PendingDownload>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    loop {
+        let job = tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() { break; } else { continue; }
+            }
+            j = rx.recv() => match j {
+                Some(j) => j,
+                None => break, // sender dropped: bot is shutting down
+            },
+        };
+
+        // A duplicate (e.g. replayed from the journal *and* re-delivered by
+        // Telegram after a crash) may already be gone — skip if so.
+        if !journal.lock().await.iter().any(|p| p.update_id == job.update_id) {
+            continue;
+        }
+
+        // Retry transient failures with backoff; stop promptly if asked.
+        loop {
+            if *stop_rx.borrow() {
+                return; // leave the job in the journal for the next start
+            }
+            match download_attachment(
+                &client,
+                &base,
+                &token,
+                &job.file_id,
+                job.file_name.as_deref(),
+                &save_dir,
+            )
+            .await
+            {
+                Ok(dest) => {
+                    let name = dest
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file".to_string());
+                    let mut note = format!("saved file: {} → {}", name, dest.display());
+                    if !job.caption.is_empty() {
+                        note.push_str(&format!(" — {}", job.caption));
+                    }
+                    if append_timestamped(&file, &note).await.is_ok() {
+                        set_status(&status, &id, |s| {
+                            s.message_count += 1;
+                            s.last_message_at = Some(Local::now().format("%H:%M").to_string());
+                            s.last_error = None;
+                        })
+                        .await;
+                        persist_status(&status_path, &status).await;
+                        react(&client, &base, &token, job.chat_id, job.message_id).await;
+                    }
+                    break;
+                }
+                Err(e) if e.permanent => {
+                    let mut note = format!("could not save file: {}", e.msg);
+                    if !job.caption.is_empty() {
+                        note.push_str(&format!(" — {}", job.caption));
+                    }
+                    let _ = append_timestamped(&file, &note).await;
+                    send_message(&client, &base, &token, job.chat_id, &format!("⚠️ {}", e.msg))
+                        .await;
+                    break;
+                }
+                Err(e) => {
+                    set_status(&status, &id, |s| {
+                        s.last_error = Some(format!("file save failed: {}", e.msg));
+                    })
+                    .await;
+                    // Back off, but wake immediately on stop so shutdown isn't delayed.
+                    tokio::select! {
+                        _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } }
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Done (saved or permanently failed): drop it from the journal.
+        journal.lock().await.retain(|p| p.update_id != job.update_id);
+        persist_journal(&journal_file, &journal).await;
+    }
+}
+
 /// Long-poll loop for a single bot. Runs until `stop_rx` flips to true.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bot(
@@ -292,13 +730,35 @@ pub async fn run_bot(
     file: String,
     files_dir: Option<String>,
     allowed_user_id: i64,
+    api_base: Option<String>,
+    daily_send: bool,
+    daily_time: String,
     status: StatusMap,
     status_path: PathBuf,
     client: reqwest::Client,
     mut stop_rx: watch::Receiver<bool>,
 ) {
+    let base = resolve_api_base(api_base.as_deref());
+
+    // If a daily digest is configured, spawn it alongside the poll loop. It needs
+    // a concrete chat to send to: in a private chat the owner's user id is also
+    // the chat id, so we require `allowed_user_id` to be set.
+    if daily_send && allowed_user_id != 0 {
+        tokio::spawn(daily_send_loop(
+            id.clone(),
+            base.clone(),
+            token.clone(),
+            file.clone(),
+            allowed_user_id,
+            daily_time,
+            status.clone(),
+            client.clone(),
+            stop_rx.clone(),
+        ));
+    }
+
     // Validate token / fetch username up front.
-    match get_me(&client, &token).await {
+    match get_me(&client, &base, &token).await {
         Ok(name) => {
             set_status(&status, &id, |s| {
                 s.username = Some(name);
@@ -318,7 +778,7 @@ pub async fn run_bot(
 
     // Resume from the persisted offset so a restart doesn't replay old messages.
     let mut offset: i64 = { status.lock().await.get(&id).map(|s| s.offset).unwrap_or(0) };
-    let updates_url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+    let updates_url = format!("{}/bot{}/getUpdates", base, token);
 
     // Resolve where received files are saved: the configured folder, or an
     // `attachments` folder next to the markdown file when unset.
@@ -330,6 +790,35 @@ pub async fn run_bot(
             .map(|p| p.join("attachments"))
             .unwrap_or_else(|| PathBuf::from("attachments")),
     };
+
+    // Whether file downloads are subject to the public API's 20 MB cap.
+    let capped = base == DEFAULT_API_BASE;
+
+    // Per-bot download queue + crash-safe journal. Files are saved on a
+    // background worker so a slow download can't stall the poll loop; the
+    // journal lets a restart resume downloads that were acked to Telegram but
+    // not yet written to disk.
+    let journal_file = journal_path(&status_path, &id);
+    let journal: Journal = Arc::new(Mutex::new(load_journal(&journal_file)));
+    let (tx, rx) = mpsc::unbounded_channel::<PendingDownload>();
+    // Re-enqueue anything left over from a previous run.
+    for job in journal.lock().await.iter().cloned() {
+        let _ = tx.send(job);
+    }
+    tokio::spawn(download_worker(
+        id.clone(),
+        base.clone(),
+        token.clone(),
+        file.clone(),
+        save_dir.clone(),
+        status.clone(),
+        status_path.clone(),
+        journal.clone(),
+        journal_file.clone(),
+        client.clone(),
+        rx,
+        stop_rx.clone(),
+    ));
 
     loop {
         if *stop_rx.borrow() {
@@ -398,60 +887,106 @@ pub async fn run_bot(
                                 continue;
                             }
 
-                            // Decide what to write. A plain text message appends its
-                            // text; a file/photo/etc is downloaded to `save_dir` and a
-                            // note recording the saved path (plus any caption) is
-                            // appended. Anything else is acknowledged but not saved.
-                            let caption = msg["caption"].as_str().unwrap_or("").trim();
-                            let line = if let Some(t) = msg["text"].as_str() {
-                                Some(t.to_string())
-                            } else if let Some((file_id, file_name)) = extract_attachment(msg) {
-                                match download_attachment(
-                                    &client,
-                                    &token,
-                                    &file_id,
-                                    file_name.as_deref(),
-                                    &save_dir,
-                                )
-                                .await
-                                {
-                                    Ok(dest) => {
-                                        let name = dest
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "file".to_string());
-                                        let mut note =
-                                            format!("saved file: {} → {}", name, dest.display());
-                                        if !caption.is_empty() {
-                                            note.push_str(&format!(" — {}", caption));
-                                        }
-                                        Some(note)
-                                    }
-                                    Err(e) if e.permanent => {
-                                        // Telegram will never serve this file (usually >20 MB).
-                                        // Record a note and let the offset advance so it can't
-                                        // block every later message forever.
-                                        let mut note =
-                                            format!("could not save file: {}", e.msg);
-                                        if !caption.is_empty() {
-                                            note.push_str(&format!(" — {}", caption));
-                                        }
-                                        Some(note)
-                                    }
-                                    Err(e) => {
-                                        // Transient (network/disk) failure: record the error
-                                        // and don't advance the offset, so Telegram re-delivers
-                                        // and we retry.
-                                        set_status(&status, &id, |s| {
-                                            s.last_error =
-                                                Some(format!("file save failed: {}", e.msg));
-                                        })
-                                        .await;
-                                        write_failed = true;
-                                        break;
-                                    }
+                            // Decide what to do. A file/photo/etc is queued for a
+                            // background download (so a slow transfer can't stall this
+                            // loop); a plain text message is appended inline; anything
+                            // else is acknowledged but not saved.
+                            let caption = msg["caption"].as_str().unwrap_or("").trim().to_string();
+
+                            if let Some(att) = extract_attachment(msg) {
+                                let Some(uid) = update_id else { continue };
+                                let display_name =
+                                    att.file_name.clone().unwrap_or_else(|| "file".to_string());
+
+                                // Already queued (re-delivered after a crash, or replayed
+                                // from the journal) — just confirm it and move on.
+                                if journal.lock().await.iter().any(|p| p.update_id == uid) {
+                                    offset = offset.max(uid + 1);
+                                    continue;
                                 }
-                            } else {
+
+                                // Pre-empt the public API's 20 MB cap: a getFile we know
+                                // will fail is worth skipping. Record the note now and tell
+                                // the user why instead of attempting a doomed download.
+                                if capped
+                                    && att.file_size > PUBLIC_DOWNLOAD_LIMIT
+                                {
+                                    let mut note = format!(
+                                        "could not save file: {} is {} — over the 20 MB Bot API limit; enable the local server to receive it",
+                                        display_name,
+                                        human_size(att.file_size)
+                                    );
+                                    if !caption.is_empty() {
+                                        note.push_str(&format!(" — {}", caption));
+                                    }
+                                    match append_timestamped(&file, &note).await {
+                                        Ok(()) => {
+                                            offset = offset.max(uid + 1);
+                                            // The file was *not* saved, so don't bump
+                                            // the "saved" counter — just record the
+                                            // activity timestamp for the dashboard.
+                                            set_status(&status, &id, |s| {
+                                                s.last_message_at =
+                                                    Some(Local::now().format("%H:%M").to_string());
+                                            })
+                                            .await;
+                                            send_message(
+                                                &client,
+                                                &base,
+                                                &token,
+                                                chat_id,
+                                                &format!(
+                                                    "⚠️ {} ({}) is over the 20 MB limit and was not saved.",
+                                                    display_name,
+                                                    human_size(att.file_size)
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            set_status(&status, &id, |s| {
+                                                s.last_error = Some(format!("write failed: {}", e));
+                                            })
+                                            .await;
+                                            write_failed = true;
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // Journal the job *before* advancing the offset so a crash
+                                // can't ack the update to Telegram with no record of it,
+                                // then hand it to the background worker.
+                                let job = PendingDownload {
+                                    update_id: uid,
+                                    file_id: att.file_id,
+                                    file_name: att.file_name,
+                                    caption: caption.clone(),
+                                    chat_id,
+                                    message_id,
+                                };
+                                journal.lock().await.push(job.clone());
+                                persist_journal(&journal_file, &journal).await;
+                                let _ = tx.send(job);
+                                offset = offset.max(uid + 1);
+                                send_message(
+                                    &client,
+                                    &base,
+                                    &token,
+                                    chat_id,
+                                    &format!(
+                                        "⬇️ Saving {} ({})…",
+                                        display_name,
+                                        human_size(att.file_size)
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
+
+                            // Plain text: append inline (fast).
+                            let Some(text) = msg["text"].as_str().map(|s| s.to_string()) else {
                                 // Non-text, non-file update: nothing to save, but confirm
                                 // it so Telegram doesn't keep re-delivering it.
                                 if let Some(uid) = update_id {
@@ -459,7 +994,6 @@ pub async fn run_bot(
                                 }
                                 continue;
                             };
-                            let Some(text) = line else { continue };
 
                             match append_timestamped(&file, &text).await {
                                 Ok(()) => {
@@ -474,7 +1008,7 @@ pub async fn run_bot(
                                         s.last_error = None;
                                     })
                                     .await;
-                                    react(&client, &token, chat_id, message_id).await;
+                                    react(&client, &base, &token, chat_id, message_id).await;
                                 }
                                 Err(e) => {
                                     // Do NOT advance the offset: leaving this update

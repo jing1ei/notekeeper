@@ -71,7 +71,7 @@
            width: 460px; max-width: 92vw; padding: 20px; }
   .modal h2 { margin: 0 0 14px; font-size: 15px; }
   label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], input[type=time] {
     width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--panel-2); color: var(--text); font: inherit;
   }
@@ -92,7 +92,10 @@
       <h1>Notekeeper</h1>
       <div class="sub" id="summary">Loading…</div>
     </div>
-    <button class="primary" id="add-btn">+ Add bot</button>
+    <div style="display:flex; gap:8px; align-items:center">
+      <button id="server-btn">Local server</button>
+      <button class="primary" id="add-btn">+ Add bot</button>
+    </div>
   </header>
 
   <main>
@@ -148,6 +151,10 @@
       <input type="number" id="f-user" placeholder="123456789" />
       <div class="hint">Get it by messaging @userinfobot. Leave 0 to allow anyone (not recommended).</div>
 
+      <label>Bot API server (optional)</label>
+      <input type="text" id="f-api-base" placeholder="https://api.telegram.org" />
+      <div class="hint">Leave blank to use Telegram's public API, which can't download files larger than 20&nbsp;MB (most videos). Point this at a self-hosted local Bot API server (e.g. http://localhost:8081) to save files up to 2&nbsp;GB.</div>
+
       <label>Local shortcut (optional)</label>
       <div class="file-row">
         <input type="text" id="f-shortcut" placeholder="e.g. ⌘⇧I — click Record" readonly />
@@ -157,6 +164,13 @@
       <div class="hint">Press this hotkey anywhere on the Mac to pop up a quick-note box for this file.</div>
 
       <div class="check">
+        <input type="checkbox" id="f-daily" />
+        <label for="f-daily" style="margin:0;color:var(--text)">Send this file to me every day at</label>
+        <input type="time" id="f-daily-time" value="08:00" style="width:auto;flex:0 0 auto;margin:0" />
+      </div>
+      <div class="hint">Each morning the bot sends the file's exact contents back to you on Telegram (split across messages if long). Requires your Telegram user ID above.</div>
+
+      <div class="check">
         <input type="checkbox" id="f-enabled" checked />
         <label for="f-enabled" style="margin:0;color:var(--text)">Enabled (start polling now)</label>
       </div>
@@ -164,6 +178,49 @@
       <div class="modal-actions">
         <button id="cancel-btn">Cancel</button>
         <button class="primary" id="save-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Local server settings modal -->
+  <div class="overlay" id="srv-overlay">
+    <div class="modal">
+      <h2>Local Bot API server</h2>
+      <div class="hint" style="margin-bottom:4px">
+        Telegram's public API can't download files larger than 20&nbsp;MB (most videos).
+        Run a local server to raise that to 2&nbsp;GB. Install it first, e.g.
+        <span class="kbd">brew install telegram-bot-api</span>.
+      </div>
+
+      <div class="check">
+        <input type="checkbox" id="s-enabled" />
+        <label for="s-enabled" style="margin:0;color:var(--text)">Run the local server and route all bots through it</label>
+      </div>
+
+      <label>api_id</label>
+      <input type="number" id="s-api-id" placeholder="123456" />
+      <label>api_hash</label>
+      <input type="text" id="s-api-hash" placeholder="leave blank to keep stored value" />
+      <div class="hint">Get both from <b>my.telegram.org</b> → API development tools. Stored in the macOS Keychain.</div>
+
+      <label>Server binary path (optional)</label>
+      <input type="text" id="s-bin" placeholder="auto-detect" />
+      <div class="hint" id="s-bin-hint">Leave blank to auto-detect.</div>
+
+      <label>Port</label>
+      <input type="number" id="s-port" placeholder="8081" />
+
+      <div class="hint" id="s-status" style="margin-top:10px"></div>
+      <div class="hint">
+        Note: a bot already used with the public API must be logged out of it before a local
+        server can take over — send <span class="kbd">https://api.telegram.org/bot&lt;token&gt;/logOut</span>
+        once per bot. The bot logs back in automatically if you later disable the local server.
+      </div>
+
+      <div class="validate-msg" id="s-msg"></div>
+      <div class="modal-actions">
+        <button id="s-cancel-btn">Cancel</button>
+        <button class="primary" id="s-save-btn">Save</button>
       </div>
     </div>
   </div>
@@ -197,15 +254,20 @@
     }).join('');
   }
 
+  // A bot's error is either the poll-loop error or a failed daily send; surface
+  // whichever is set (the poll loop never clears the daily one).
+  function botError(b) {
+    return b.status.last_error || b.status.last_daily_error || '';
+  }
   function dotClass(b) {
     if (!b.enabled) return 'grey';
-    if (b.status.last_error) return 'red';
+    if (botError(b)) return 'red';
     if (b.status.running) return 'green';
     return 'yellow';
   }
   function dotTitle(b) {
     if (!b.enabled) return 'Disabled';
-    if (b.status.last_error) return 'Error: ' + b.status.last_error;
+    if (botError(b)) return 'Error: ' + botError(b);
     if (b.status.running) return 'Running';
     return 'Starting…';
   }
@@ -224,8 +286,9 @@
 
     let running = 0, errors = 0;
     for (const b of bots) {
-      if (b.enabled && b.status.running && !b.status.last_error) running++;
-      if (b.enabled && b.status.last_error) errors++;
+      const err = botError(b);
+      if (b.enabled && b.status.running && !err) running++;
+      if (b.enabled && err) errors++;
       const at = b.status.username ? '@' + b.status.username : '';
       const last = b.status.last_message_at ? 'last ' + b.status.last_message_at : '';
       const tr = document.createElement('tr');
@@ -233,11 +296,12 @@
         <td>
           <span class="dot ${dotClass(b)}" title="${esc(dotTitle(b))}"></span>
           <span class="name">${esc(b.name)}</span> <span class="at">${esc(at)}</span>
-          ${b.status.last_error ? `<div class="err">${esc(b.status.last_error)}</div>` : ''}
+          ${botError(b) ? `<div class="err">${esc(botError(b))}</div>` : ''}
         </td>
         <td>${b.file
             ? `<span class="path open" data-open="${esc(b.file)}" title="Open in text editor">${esc(b.file)}</span>`
-            : '<span class="path">—</span>'}</td>
+            : '<span class="path">—</span>'}
+          ${b.daily_send ? `<div class="at">🕗 sends daily at ${esc(b.daily_time || '08:00')}</div>` : ''}</td>
         <td>${b.shortcut ? `<span class="kbd">${esc(prettyShortcut(b.shortcut))}</span>` : '<span class="at">—</span>'}</td>
         <td>${b.status.message_count} saved<div class="at">${esc(last)}</div></td>
         <td><span class="toggle" title="Click to toggle" data-id="${b.id}" data-en="${b.enabled}">
@@ -280,9 +344,12 @@
     $('f-file').value = bot?.file || '';
     $('f-files-dir').value = bot?.files_dir || '';
     $('f-user').value = bot ? bot.allowed_user_id : 0;
+    $('f-api-base').value = bot?.api_base || '';
     const acc = bot?.shortcut || '';
     $('f-shortcut').dataset.acc = acc;
     $('f-shortcut').value = acc ? prettyShortcut(acc) : '';
+    $('f-daily').checked = bot ? !!bot.daily_send : false;
+    $('f-daily-time').value = (bot && bot.daily_time) ? bot.daily_time : '08:00';
     $('f-enabled').checked = bot ? bot.enabled : true;
     clearValidate();
     $('overlay').classList.add('show');
@@ -296,7 +363,8 @@
     const msg = $('validate-msg');
     msg.textContent = 'Checking…'; msg.className = 'validate-msg';
     try {
-      const username = await invoke('validate_token', { token });
+      const apiBase = $('f-api-base').value.trim() || null;
+      const username = await invoke('validate_token', { token, apiBase });
       msg.textContent = '✓ Connected to @' + username;
       msg.className = 'validate-msg ok';
     } catch (e) {
@@ -353,8 +421,11 @@
       file: $('f-file').value.trim(),
       filesDir: $('f-files-dir').value.trim() || null,
       allowedUserId: parseInt($('f-user').value || '0', 10) || 0,
+      apiBase: $('f-api-base').value.trim() || null,
       enabled: $('f-enabled').checked,
       shortcut: $('f-shortcut').dataset.acc || null,
+      dailySend: $('f-daily').checked,
+      dailyTime: $('f-daily-time').value || '08:00',
     };
     // On edit, a blank token keeps the existing one; on add, a token is required.
     const hadToken = $('f-token').dataset.had === '1';
@@ -381,10 +452,63 @@
     refresh();
   }
 
+  // ---- local server settings ----
+  async function openServerForm() {
+    $('s-msg').textContent = ''; $('s-msg').className = 'validate-msg';
+    let cfg = {};
+    try { cfg = await invoke('get_server_config'); } catch (e) { console.error(e); }
+    $('s-enabled').checked = !!cfg.enabled;
+    $('s-api-id').value = cfg.api_id || '';
+    $('s-api-hash').value = '';
+    $('s-api-hash').placeholder = cfg.has_api_hash ? 'leave blank to keep stored value' : 'your api_hash';
+    $('s-bin').value = cfg.bin_path || '';
+    $('s-port').value = cfg.port || 8081;
+    $('s-bin-hint').textContent = cfg.detected_bin
+      ? 'Using: ' + cfg.detected_bin
+      : '⚠️ telegram-bot-api not found — install it or enter its full path.';
+    if (cfg.running) {
+      $('s-status').textContent = '🟢 Server running';
+      $('s-status').className = 'hint';
+    } else if (cfg.last_error) {
+      $('s-status').textContent = '🔴 Server not running — ' + cfg.last_error;
+      $('s-status').className = 'hint bad';
+    } else {
+      $('s-status').textContent = '⚪ Server not running';
+      $('s-status').className = 'hint';
+    }
+    $('srv-overlay').classList.add('show');
+  }
+  function closeServerForm() { $('srv-overlay').classList.remove('show'); }
+
+  async function saveServerConfig() {
+    const args = {
+      enabled: $('s-enabled').checked,
+      binPath: $('s-bin').value.trim() || null,
+      port: parseInt($('s-port').value || '8081', 10) || 8081,
+      apiId: parseInt($('s-api-id').value || '0', 10) || 0,
+      apiHash: $('s-api-hash').value.trim() || null,
+    };
+    $('s-save-btn').disabled = true;
+    const m = $('s-msg');
+    m.textContent = 'Applying…'; m.className = 'validate-msg';
+    try {
+      await invoke('update_server_config', args);
+      closeServerForm();
+      refresh();
+    } catch (e) {
+      m.textContent = '✗ ' + e; m.className = 'validate-msg bad';
+    } finally {
+      $('s-save-btn').disabled = false;
+    }
+  }
+
   // Wire up the static controls here (not as inline on* attributes): a release
   // build's CSP nonces the <script>, which makes the browser ignore
   // 'unsafe-inline', so inline onclick handlers would be silently blocked.
   $('add-btn').onclick = () => openForm();
+  $('server-btn').onclick = () => openServerForm();
+  $('s-cancel-btn').onclick = () => closeServerForm();
+  $('s-save-btn').onclick = () => saveServerConfig();
   $('validate-btn').onclick = () => validateToken();
   $('browse-btn').onclick = () => browse();
   $('browse-dir-btn').onclick = () => browseDir();

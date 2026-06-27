@@ -77,8 +77,8 @@ pub fn start(cfg: &ServerConfig, data_dir: &Path) -> Result<ServerHandle, String
         return Err("api_id and api_hash are required to run the local server".into());
     }
     let bin = locate_binary(cfg.bin_path.as_deref()).ok_or_else(|| {
-        "telegram-bot-api not found — install it (e.g. `brew install telegram-bot-api`) \
-         or set its path in server settings"
+        "telegram-bot-api not found — build it from source \
+         (https://tdlib.github.io/telegram-bot-api/build.html) and set its path in server settings"
             .to_string()
     })?;
 

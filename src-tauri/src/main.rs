@@ -894,7 +894,12 @@ fn main() {
             // Kill the managed server when the app exits so it isn't orphaned.
             if let tauri::RunEvent::Exit = event {
                 let state = app_handle.state::<AppState>();
-                if let Ok(mut guard) = state.server.lock() {
+                // Bind the lock to a named local (declared after `state`) so the
+                // guard is dropped before `state`. A temporary in the `if let`
+                // scrutinee would outlive the `state` it borrows from and fail to
+                // borrow-check under edition 2021 (E0597).
+                let lock = state.server.lock();
+                if let Ok(mut guard) = lock {
                     *guard = None;
                 }
             }

@@ -213,7 +213,23 @@ To receive files larger than 20 MB (most videos), the app can spawn and manage a
 [`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) server in `--local` mode,
 which raises the download limit to 2 GB and writes files straight to disk.
 
-1. Install it once, e.g. `brew install telegram-bot-api`.
+1. Build `telegram-bot-api` from source once — there is **no Homebrew formula** for it.
+   The easiest path is the official build-instructions generator at
+   <https://tdlib.github.io/telegram-bot-api/build.html> (pick macOS). In short:
+
+   ```bash
+   xcode-select --install
+   brew install gperf cmake openssl zlib
+   git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+   cd telegram-bot-api && mkdir build && cd build
+   cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=.. \
+         -DOPENSSL_ROOT_DIR=$(brew --prefix openssl) ..
+   cmake --build . --target install
+   ```
+
+   The binary lands at `telegram-bot-api/bin/telegram-bot-api`. Either copy it into
+   `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel) so the app
+   auto-detects it, or paste its full path into the **Server binary path** field.
 2. Get an `api_id` and `api_hash` from **my.telegram.org → API development tools**.
 3. In the app, click **Local server**, tick "Run the local server…", enter the
    `api_id`/`api_hash`, and save. The `api_hash` is stored in the macOS Keychain.

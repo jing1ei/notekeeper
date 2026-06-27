@@ -84,7 +84,9 @@ pub struct BotConfig {
     pub allowed_user_id: i64,
     /// Base URL of the Telegram Bot API. Unset/empty uses the public
     /// `https://api.telegram.org`, which caps file downloads at 20 MB. Point this
-    /// at a self-hosted local Bot API server (e.g. `http://localhost:8081`) to
+    /// at a self-hosted local Bot API server (e.g. `http://127.0.0.1:8081` — the
+    /// app binds the managed server to `127.0.0.1`, so prefer that over
+    /// `localhost`, which can resolve to IPv6 `::1` and miss it) to
     /// raise the limit to 2 GB so large videos can be saved.
     #[serde(default)]
     pub api_base: Option<String>,

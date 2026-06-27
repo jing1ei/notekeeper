@@ -591,6 +591,10 @@ async fn daily_send_loop(
         match tokio::fs::read_to_string(&file).await {
             Ok(content) => {
                 if content.trim().is_empty() {
+                    // An empty file isn't a failure — today's send is a no-op, so
+                    // clear any stale error from a previous day rather than letting
+                    // it linger until the next non-empty send.
+                    set_status(&status, &id, |s| s.last_daily_error = None).await;
                     continue; // nothing to send today
                 }
                 let mut ok = true;
@@ -640,8 +644,13 @@ async fn download_worker(
 ) {
     loop {
         let job = tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() { break; } else { continue; }
+            // `changed()` errors when the sender is dropped; treat that as a stop
+            // too (matching `daily_send_loop`). We only ever send `true`, so any
+            // change means stop. Without the `is_err()` check a dropped sender
+            // would make this arm complete instantly every iteration and spin the
+            // loop instead of ending the worker.
+            res = stop_rx.changed() => {
+                if res.is_err() || *stop_rx.borrow() { break; } else { continue; }
             }
             j = rx.recv() => match j {
                 Some(j) => j,
@@ -675,19 +684,65 @@ async fn download_worker(
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "file".to_string());
+                    // The size comes from the saved file itself, so it's accurate
+                    // even when Telegram didn't report one.
+                    let size = tokio::fs::metadata(&dest)
+                        .await
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(0);
                     let mut note = format!("saved file: {} → {}", name, dest.display());
                     if !job.caption.is_empty() {
                         note.push_str(&format!(" — {}", job.caption));
                     }
-                    if append_timestamped(&file, &note).await.is_ok() {
-                        set_status(&status, &id, |s| {
-                            s.message_count += 1;
-                            s.last_message_at = Some(Local::now().format("%H:%M").to_string());
-                            s.last_error = None;
-                        })
-                        .await;
-                        persist_status(&status_path, &status).await;
-                        react(&client, &base, &token, job.chat_id, job.message_id).await;
+                    match append_timestamped(&file, &note).await {
+                        Ok(()) => {
+                            set_status(&status, &id, |s| {
+                                s.message_count += 1;
+                                s.last_message_at =
+                                    Some(Local::now().format("%H:%M").to_string());
+                                s.last_error = None;
+                            })
+                            .await;
+                            persist_status(&status_path, &status).await;
+                            react(&client, &base, &token, job.chat_id, job.message_id).await;
+                            // Confirm completion. The ack is sent only once the file
+                            // is actually on disk (there's no "Saving…" message
+                            // beforehand), so a slow, large download no longer looks
+                            // stuck mid-save.
+                            send_message(
+                                &client,
+                                &base,
+                                &token,
+                                job.chat_id,
+                                &format!("✅ Saved {} ({})", name, human_size(size)),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            // The file downloaded fine but its note couldn't be
+                            // written. Record the error and say so, rather than
+                            // sending a misleading "✅ Saved" with no record of it
+                            // in the markdown file. The file is on disk, so the job
+                            // is still considered done (retrying would re-download).
+                            set_status(&status, &id, |s| {
+                                s.last_error =
+                                    Some(format!("file saved but note write failed: {}", e));
+                            })
+                            .await;
+                            send_message(
+                                &client,
+                                &base,
+                                &token,
+                                job.chat_id,
+                                &format!(
+                                    "⚠️ Downloaded {} ({}) but couldn't write its note to the file: {}",
+                                    name,
+                                    human_size(size),
+                                    e
+                                ),
+                            )
+                            .await;
+                        }
                     }
                     break;
                 }
@@ -755,6 +810,14 @@ pub async fn run_bot(
             client.clone(),
             stop_rx.clone(),
         ));
+    } else {
+        // The daily digest isn't active for this (re)start. Clear any stale daily
+        // error left in memory from a previous run so the tray and UI don't keep
+        // showing a red error for a send that's no longer scheduled (e.g. after
+        // the user unticks daily-send following a failed send). `last_daily_error`
+        // is otherwise only ever cleared by a *successful* send, which can't
+        // happen once the loop is gone.
+        set_status(&status, &id, |s| s.last_daily_error = None).await;
     }
 
     // Validate token / fetch username up front.
@@ -970,18 +1033,10 @@ pub async fn run_bot(
                                 persist_journal(&journal_file, &journal).await;
                                 let _ = tx.send(job);
                                 offset = offset.max(uid + 1);
-                                send_message(
-                                    &client,
-                                    &base,
-                                    &token,
-                                    chat_id,
-                                    &format!(
-                                        "⬇️ Saving {} ({})…",
-                                        display_name,
-                                        human_size(att.file_size)
-                                    ),
-                                )
-                                .await;
+                                // No "Saving…" ack here on purpose: the worker sends
+                                // a single "✅ Saved …" message once the download
+                                // actually finishes, so a long transfer doesn't look
+                                // perpetually stuck on a "Saving…" note.
                                 continue;
                             }
 

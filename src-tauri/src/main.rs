@@ -81,7 +81,10 @@ struct BotView {
     has_token: bool,
     file: String,
     files_dir: Option<String>,
-    allowed_user_id: i64,
+    /// Sent to the webview as a string so a 64-bit Telegram user id can't lose
+    /// precision when JS reads it (JSON numbers are IEEE-754 doubles, exact only
+    /// up to 2^53). The form posts it back as a string too; see `add_bot`.
+    allowed_user_id: String,
     api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
@@ -123,7 +126,7 @@ async fn start_bot(bot: &BotConfig, state: &AppState) {
     // Only route to the local server when its process is actually up, so a bot
     // falls back to the public API instead of a dead port if it failed to start.
     let api_base = {
-        let server_running = state.server.lock().unwrap().is_some();
+        let server_running = state.server.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         let cfg = state.config.lock().await;
         effective_api_base(bot, &cfg.server, server_running)
     };
@@ -165,24 +168,24 @@ fn server_data_dir(state: &AppState) -> PathBuf {
 async fn restart_local_server(state: &AppState) -> Result<(), String> {
     // Dropping the old handle kills its child process.
     {
-        let mut guard = state.server.lock().unwrap();
+        let mut guard = state.server.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
     let cfg = { state.config.lock().await.server.clone() };
     if !cfg.enabled {
-        *state.server_error.lock().unwrap() = None;
+        *state.server_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Ok(());
     }
     let data_dir = server_data_dir(state);
     match server::start(&cfg, &data_dir) {
         Ok(handle) => {
-            *state.server.lock().unwrap() = Some(handle);
-            *state.server_error.lock().unwrap() = None;
+            *state.server.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            *state.server_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
             Ok(())
         }
         Err(e) => {
             // Keep the reason so the settings UI can show why the server is down.
-            *state.server_error.lock().unwrap() = Some(e.clone());
+            *state.server_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
             Err(e)
         }
     }
@@ -268,7 +271,7 @@ async fn get_bots(state: State<'_, AppState>) -> Result<Vec<BotView>, String> {
             has_token: !b.token.is_empty(),
             file: b.file.clone(),
             files_dir: b.files_dir.clone(),
-            allowed_user_id: b.allowed_user_id,
+            allowed_user_id: b.allowed_user_id.to_string(),
             api_base: b.api_base.clone(),
             enabled: b.enabled,
             shortcut: b.shortcut.clone(),
@@ -288,13 +291,16 @@ async fn add_bot(
     token: String,
     file: String,
     files_dir: Option<String>,
-    allowed_user_id: i64,
+    allowed_user_id: String,
     api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
     daily_send: bool,
     daily_time: String,
 ) -> Result<(), String> {
+    // The id arrives as a string (see `BotView::allowed_user_id`); parse it back
+    // to i64, treating blank/invalid input as 0 ("allow anyone").
+    let allowed_user_id = allowed_user_id.trim().parse::<i64>().unwrap_or(0);
     let bot = BotConfig {
         id: Uuid::new_v4().to_string(),
         name,
@@ -337,7 +343,7 @@ async fn update_bot(
     token: String,
     file: String,
     files_dir: Option<String>,
-    allowed_user_id: i64,
+    allowed_user_id: String,
     api_base: Option<String>,
     enabled: bool,
     shortcut: Option<String>,
@@ -345,6 +351,9 @@ async fn update_bot(
     daily_time: String,
 ) -> Result<(), String> {
     let new_token = token.trim().to_string();
+    // Parse the user id back from the string the form posts (see
+    // `BotView::allowed_user_id`); blank/invalid means 0 ("allow anyone").
+    let allowed_user_id = allowed_user_id.trim().parse::<i64>().unwrap_or(0);
     let updated;
     {
         let mut config = state.config.lock().await;
@@ -463,7 +472,24 @@ async fn validate_token(
     token: String,
     api_base: Option<String>,
 ) -> Result<String, String> {
-    let base = bots::resolve_api_base(api_base.as_deref());
+    // Validate against the same base a bot would actually use: an explicit
+    // per-bot override wins; otherwise the managed local server when it's enabled
+    // *and* running; otherwise the public API. Without this, a token validated
+    // here always hit the public API even when the bot will run via the local
+    // server, so "Validate token" didn't reflect the real path.
+    let explicit = api_base.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let base = if explicit.is_some() {
+        bots::resolve_api_base(explicit)
+    } else {
+        let server_running = state.server.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let cfg = state.config.lock().await;
+        let chosen = if cfg.server.enabled && server_running {
+            Some(server::local_url(cfg.server.effective_port()))
+        } else {
+            None
+        };
+        bots::resolve_api_base(chosen.as_deref())
+    };
     bots::get_me(&state.http, &base, &token).await
 }
 
@@ -489,8 +515,8 @@ struct ServerView {
 async fn get_server_config(state: State<'_, AppState>) -> Result<ServerView, String> {
     let cfg = { state.config.lock().await.server.clone() };
     let detected = server::locate_binary(cfg.bin_path.as_deref()).map(|p| p.display().to_string());
-    let running = state.server.lock().unwrap().is_some();
-    let last_error = state.server_error.lock().unwrap().clone();
+    let running = state.server.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let last_error = state.server_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(ServerView {
         enabled: cfg.enabled,
         bin_path: cfg.bin_path.clone(),
@@ -898,10 +924,12 @@ fn main() {
                 // guard is dropped before `state`. A temporary in the `if let`
                 // scrutinee would outlive the `state` it borrows from and fail to
                 // borrow-check under edition 2021 (E0597).
+                // Recover the guard even if the lock was poisoned by an earlier
+                // panic — otherwise a poisoned lock would skip the kill and leave
+                // the child server process orphaned.
                 let lock = state.server.lock();
-                if let Ok(mut guard) = lock {
-                    *guard = None;
-                }
+                let mut guard = lock.unwrap_or_else(|e| e.into_inner());
+                *guard = None;
             }
         });
 }

@@ -159,6 +159,12 @@ Saved files are prefixed with a timestamp so names never collide. Only messages 
 allowed user ID are saved; anything else is ignored. The bot reacts with 👍 on each saved
 message or file so you get confirmation in Telegram.
 
+Only text and downloadable attachments (documents, photos, videos, audio, voice, stickers,
+etc.) are saved. Other message types — locations, contacts, polls, and the like — are
+acknowledged (so Telegram stops re-delivering them) but nothing is written to the file. For files, it also replies with a
+`✅ Saved <name> (<size>)` message once the download actually finishes — large transfers
+confirm on completion rather than up front, so they never look stuck mid-save.
+
 ## Where settings live
 
 Your bot list (names, file paths, user IDs, shortcuts) is stored at:

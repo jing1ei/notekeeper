@@ -71,7 +71,9 @@ cargo tauri build   # build a real app bundle
 
 The finished app is at
 `src-tauri/target/release/bundle/macos/Notekeeper.app`
-(and a `.dmg` under `bundle/dmg/`). Drag `Notekeeper.app` into `/Applications`.
+(and usually a `.dmg` under `bundle/dmg/` — the `.dmg` is just a convenience and
+is skipped if macOS won't let Terminal control Finder; the `.app` is all you
+need). Drag `Notekeeper.app` into `/Applications`.
 
 When it launches there's **no dock icon** — look for the Notekeeper icon in the **menu
 bar**. Click it → **Open Manager** to add bots.

@@ -55,23 +55,51 @@ if [ ! -d "src-tauri/icons" ]; then
 fi
 
 # --- build ---------------------------------------------------------------
+APP="src-tauri/target/release/bundle/macos/Notekeeper.app"
+MACOS_BUNDLE_DIR="src-tauri/target/release/bundle/macos"
+DMG_DIR="src-tauri/target/release/bundle/dmg"
+
+# The .dmg packaging step (bundle_dmg.sh) mounts a "Notekeeper" volume and runs an
+# AppleScript via Finder to lay out the window. When a previous run failed partway
+# it can leave behind a read-write scratch image (rw.<pid>.*.dmg) and/or a still-
+# mounted "/Volumes/Notekeeper" — and the NEXT run then trips over that leftover
+# state and fails again. Clearing it first turns a repeating failure back into a
+# one-off, so the dmg step gets a clean shot each time.
+cleanup_dmg_leftovers() {
+  rm -f "$MACOS_BUNDLE_DIR"/rw.*.dmg 2>/dev/null
+  if [ -d "/Volumes/Notekeeper" ]; then
+    hdiutil detach "/Volumes/Notekeeper" -force >/dev/null 2>&1 || true
+  fi
+}
+
+# `cargo tauri build` exits non-zero if EITHER the compile fails OR the cosmetic
+# .dmg packaging fails — but the app bundle is produced before the dmg step, so a
+# dmg-only failure still leaves a perfectly good Notekeeper.app. Keying success off
+# the exit code therefore reports a false "Build failed" whenever only the dmg
+# breaks. Instead, delete any stale app up front and treat "Notekeeper.app exists
+# afterwards" as the real success signal (it can only exist if the compile passed).
+run_build() {
+  cleanup_dmg_leftovers
+  rm -rf "$APP" 2>/dev/null
+  CARGO_NET_OFFLINE=true cargo tauri build
+  [ -d "$APP" ]
+}
+
 # If a previous build already downloaded the crates, they're cached locally, so
 # try an OFFLINE build first: it uses that cache and never contacts crates.io,
 # avoiding the network/SSL errors entirely. Only fall back to downloading if the
-# offline build reports a missing crate.
+# offline build didn't produce the app (i.e. a missing crate, not a dmg hiccup).
 build_succeeded=false
 
 echo "▶  Attempt 1: offline build (uses crates already cached on this Mac)…"
 echo
-if CARGO_NET_OFFLINE=true cargo tauri build; then
+if run_build; then
   build_succeeded=true
 else
   echo
-  echo "ℹ️  Offline build didn't complete. Two common causes:"
-  echo "     • a few crates (e.g. keyring) aren't cached yet (a SMALL download), or"
-  echo "     • the .dmg packaging step (bundle_dmg.sh) hit a transient Finder/"
-  echo "       hdiutil race — harmless, and it usually succeeds on the next run."
-  echo "   Fetching any missing crates, then building again…"
+  echo "ℹ️  The app bundle wasn't produced. The usual cause is that a few crates"
+  echo "    (e.g. keyring) aren't cached yet — a SMALL download. Fetching them, then"
+  echo "    building again…"
   echo
   # Download just the missing crate sources first. `cargo fetch` is much lighter
   # than a full build, so on a flaky connection it has many quick chances to slip
@@ -94,7 +122,7 @@ else
     echo
     echo "✅ All crates present. Building offline now…"
     echo
-    if CARGO_NET_OFFLINE=true cargo tauri build; then
+    if run_build; then
       build_succeeded=true
     fi
   else
@@ -105,7 +133,7 @@ fi
 
 if [ "$build_succeeded" = false ]; then
   echo
-  echo "❌ Build failed — scroll up for the first error."
+  echo "❌ Build failed — the app bundle wasn't produced. Scroll up for the first error."
   echo "   If it's a network/SSL error to crates.io, it's almost always your"
   echo "   connection: a VPN, corporate proxy, or flaky Wi-Fi. Disable any VPN"
   echo "   or switch networks (a phone hotspot often works), then run this again."
@@ -116,18 +144,29 @@ if [ "$build_succeeded" = false ]; then
 fi
 
 # --- done ----------------------------------------------------------------
-APP="src-tauri/target/release/bundle/macos/Notekeeper.app"
+# The app built. The .dmg is a cosmetic extra — report it only if it was actually
+# produced, and don't fail the build when it wasn't.
+cleanup_dmg_leftovers
 echo
 echo "✅ Build complete."
-if [ -d "$APP" ]; then
-  echo "   App:  $(cd "$(dirname "$APP")" && pwd)/Notekeeper.app"
-  echo "   (a .dmg is alongside it under bundle/dmg/)"
-  echo
-  echo "Revealing it in Finder. Drag Notekeeper.app into /Applications to install."
-  open -R "$APP"
+echo "   App:  $(cd "$(dirname "$APP")" && pwd)/Notekeeper.app"
+# Match the final dmg by glob so this works on any arch (aarch64 / x86_64) and
+# version. The rw.*.dmg scratch images live in the macos/ dir, not here, so this
+# only ever picks up the finished disk image.
+DMG="$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -1)"
+if [ -n "$DMG" ] && [ -f "$DMG" ]; then
+  echo "   DMG:  $(cd "$DMG_DIR" && pwd)/$(basename "$DMG")"
 else
-  echo "   Bundle not found at the expected path — check the output above."
+  echo
+  echo "ℹ️  The .dmg wasn't created — only the app (which is all you need: just drag"
+  echo "    it to /Applications). The dmg step fails when Terminal isn't allowed to"
+  echo "    control Finder. To get the dmg too, grant it once in"
+  echo "    System Settings → Privacy & Security → Automation → Terminal → Finder,"
+  echo "    then run this again."
 fi
+echo
+echo "Revealing the app in Finder. Drag Notekeeper.app into /Applications to install."
+open -R "$APP"
 
 echo
 echo "Press any key to close."

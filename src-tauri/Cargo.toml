@@ -18,6 +18,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+# Advisory (flock-style) file locking so appends to a markdown file coordinate
+# with other processes (e.g. Python scripts) writing to the same file.
+fs2 = "0.4"
 # macOS Keychain-backed token storage. `apple-native` selects the Security
 # framework backend (no backend is enabled by default in keyring 3.x).
 keyring = { version = "3", features = ["apple-native"] }

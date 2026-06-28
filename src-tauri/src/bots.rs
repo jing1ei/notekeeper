@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Mutex};
 
 /// getFile over the public Bot API only serves files up to 20 MB. A self-hosted
@@ -219,13 +218,84 @@ pub async fn append_timestamped(path: &str, text: &str) -> std::io::Result<()> {
     }
     let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
     let line = format!("- [{}] {}\n", ts, text);
-    let mut file = tokio::fs::OpenOptions::new()
+    let path = path.to_string();
+    // The actual write runs on a blocking thread because the advisory lock
+    // (and the short retry/backoff) are blocking syscalls; doing them on the
+    // async runtime would stall other bots' poll loops.
+    tokio::task::spawn_blocking(move || append_locked(&path, line.as_bytes()))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+}
+
+/// Path of the sidecar lock file that processes coordinate on for a given data
+/// file. For `dir/notes.md` this is `dir/.notes.md.lock` — matching the
+/// convention the companion Python scripts use with `fcntl.flock`. The lock is
+/// taken on this sidecar, never on the markdown file itself.
+fn sidecar_lock_path(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("notekeeper");
+    let lock_name = format!(".{name}.lock");
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(lock_name),
+        _ => PathBuf::from(lock_name),
+    }
+}
+
+/// Append `bytes` to `path` while holding an exclusive **advisory** (flock-style)
+/// lock on the sidecar lock file (see [`sidecar_lock_path`]). Because `flock(2)`
+/// is OS-level, this interoperates with other processes — e.g. Python scripts
+/// using `fcntl.flock` on the same sidecar — so writers take turns instead of
+/// interleaving. We lock the sidecar, not the markdown file, so all writers
+/// must agree on the same lock target. The lock covers only this one append and
+/// is released as soon as the sidecar handle is dropped.
+///
+/// In the rare case the lock is already held, we retry a few times with a short
+/// backoff rather than blocking the poll loop indefinitely. If it's still locked
+/// after several attempts we return an error; the caller then leaves the Telegram
+/// update unconfirmed so the message is retried on the next poll (no data lost).
+fn append_locked(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // Acquire the advisory lock on the sidecar that other writers coordinate on.
+    let lock_path = sidecar_lock_path(path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt: u32 = 0;
+    loop {
+        // Fully-qualified call so this resolves to fs2's trait method even on
+        // newer Rust std, which has its own inherent `try_lock_exclusive`.
+        match fs2::FileExt::try_lock_exclusive(&lock_file) {
+            Ok(()) => break,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!("file locked by another process after {attempt} attempts: {e}"),
+                    ));
+                }
+                // Linear backoff: 100ms, 200ms, 300ms, 400ms.
+                std::thread::sleep(Duration::from_millis(100 * attempt as u64));
+            }
+        }
+    }
+
+    // Lock held on the sidecar: append to the actual markdown file and flush.
+    // The sidecar lock is released when `lock_file` drops, including on the
+    // early-return paths below.
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-        .await?;
-    file.write_all(line.as_bytes()).await?;
-    file.flush().await
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
 }
 
 /// Strip anything that isn't a safe filename character. Telegram-supplied names
